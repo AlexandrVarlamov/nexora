@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -25,12 +26,43 @@ DEFAULT_PHONE_KEYS = ("phone", "phoneNumber", "mobilePhone", "msisdn")
 DEFAULT_INN_KEYS = ("inn", "tax_id")
 DEFAULT_KPP_KEYS = ("kpp",)
 DEFAULT_FIO_KEYS = ("last_name", "first_name", "middle_name", "full_name", "fio")
+DEFAULT_ACCOUNT_KEYS = (
+    "account",
+    "accountNumber",
+    "account_number",
+    "beneficiaryAccount",
+    "payerAccount",
+    "recipientAccount",
+)
 TOKEN_PREFIXES = {
     "phone": "PHONE_",
     "inn": "INN_",
     "kpp": "KPP_",
     "fio": "FIO_",
+    "account": "ACCOUNT_",
+    "bank_email": "BANK_EMAIL_",
+    "email": "EMAIL_",
+    "ip": "IP_",
+    "user": "USER_",
 }
+EMAIL_PATTERN = re.compile(
+    r"(?<![\w.+-])"
+    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+"
+    r"@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+"
+    r"(?![\w.-])",
+    re.IGNORECASE,
+)
+IPV4_PATTERN = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+GPBU_LOGIN_PATTERN = re.compile(
+    r"(?<![A-Z0-9_.-])GPBU[A-Z0-9](?:[A-Z0-9_.-]*[A-Z0-9])?"
+    r"(?![A-Z0-9_-])",
+    re.IGNORECASE,
+)
+PRIVATE_IPV4_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
 
 
 class TokenizerError(RuntimeError):
@@ -76,6 +108,8 @@ def normalize_sensitive_value(kind: str, value: Any) -> str | None:
     if kind == "inn" and not re.fullmatch(r"\d{10}|\d{12}", normalized):
         return None
     if kind == "kpp" and not re.fullmatch(r"[0-9a-zа-я]{9}", normalized):
+        return None
+    if kind == "account" and not re.fullmatch(r"\d{20}", normalized):
         return None
     return normalized
 
@@ -132,6 +166,34 @@ def transform_document(
     used_tokens = set(tokens_by_value.values())
     replacements = 0
 
+    def token_for(kind: str, canonical: str) -> str:
+        registry_key = f"{kind}:{canonical}"
+        token = tokens_by_value.get(registry_key)
+        if token is None:
+            token = new_token(kind, used_tokens)
+            used_tokens.add(token)
+            tokens_by_value[registry_key] = token
+        return token
+
+    def record_occurrence(
+        pointer: list[str | int],
+        kind: str,
+        original: Any,
+        token: Any,
+        count: int = 1,
+    ) -> None:
+        occurrences.append(
+            {
+                "root": root_index,
+                "file": relative_file,
+                "pointer": pointer,
+                "kind": kind,
+                "original": original,
+                "token": token,
+                "count": count,
+            }
+        )
+
     def replace_value(value: Any, pointer: list[str | int], kind: str) -> Any:
         nonlocal replacements
 
@@ -145,25 +207,51 @@ def transform_document(
         if canonical is None:
             return value
 
-        registry_key = f"{kind}:{canonical}"
-        token = tokens_by_value.get(registry_key)
-        if token is None:
-            token = new_token(kind, used_tokens)
-            used_tokens.add(token)
-            tokens_by_value[registry_key] = token
-
-        occurrences.append(
-            {
-                "root": root_index,
-                "file": relative_file,
-                "pointer": pointer,
-                "kind": kind,
-                "original": value,
-                "token": token,
-            }
-        )
+        token = token_for(kind, canonical)
+        record_occurrence(pointer, kind, value, token)
         replacements += 1
         return token
+
+    def replace_embedded(value: str, pointer: list[str | int]) -> str:
+        nonlocal replacements
+        original = value
+        match_count = 0
+
+        def replace_email(match: re.Match[str]) -> str:
+            nonlocal match_count
+            email = match.group(0)
+            domain = email.rsplit("@", 1)[1].casefold()
+            kind = "bank_email" if domain == "int.gazprombank.ru" else "email"
+            match_count += 1
+            return token_for(kind, email.casefold())
+
+        def replace_ip(match: re.Match[str]) -> str:
+            nonlocal match_count
+            candidate = match.group(0)
+            try:
+                address = ipaddress.ip_address(candidate)
+            except ValueError:
+                return candidate
+            if not any(address in network for network in PRIVATE_IPV4_NETWORKS):
+                return candidate
+            match_count += 1
+            return token_for("ip", str(address))
+
+        def replace_user(match: re.Match[str]) -> str:
+            nonlocal match_count
+            login = match.group(0)
+            match_count += 1
+            return token_for("user", login.casefold())
+
+        masked = EMAIL_PATTERN.sub(replace_email, value)
+        masked = IPV4_PATTERN.sub(replace_ip, masked)
+        masked = GPBU_LOGIN_PATTERN.sub(replace_user, masked)
+        if masked != original:
+            record_occurrence(
+                pointer, "embedded", original, masked, count=match_count
+            )
+            replacements += match_count
+        return masked
 
     def walk(value: Any, pointer: list[str | int]) -> Any:
         if isinstance(value, dict):
@@ -178,6 +266,8 @@ def transform_document(
             return result
         if isinstance(value, list):
             return [walk(item, pointer + [index]) for index, item in enumerate(value)]
+        if isinstance(value, str):
+            return replace_embedded(value, pointer)
         return value
 
     transformed = walk(document, [])
@@ -228,7 +318,7 @@ def prepare_masking(
                 replacement_count += count
 
     manifest = {
-        "version": 2,
+        "version": 3,
         "roots": [root.name for root in roots],
         "fields": dict(sorted(field_types.items())),
         "tokens": tokens_by_value,
@@ -268,7 +358,7 @@ def decrypt_manifest(identity_file: Path, encrypted_file: Path) -> dict[str, Any
         manifest = json.loads(payload)
     except json.JSONDecodeError as error:
         raise TokenizerError("The decrypted manifest is not valid JSON") from error
-    if manifest.get("version") not in (1, 2):
+    if manifest.get("version") not in (1, 2, 3):
         raise TokenizerError("Unsupported manifest version")
     return manifest
 
@@ -324,7 +414,7 @@ def prepare_restoration(
                     f"Unexpected value at {path}:{pointer}; refusing to overwrite it"
                 )
             pointer_set(document, pointer, occurrence["original"])
-            restored_count += 1
+            restored_count += occurrence.get("count", 1)
 
         prepared.append(PreparedFile(path, serialize_json(document, source)))
 
@@ -371,6 +461,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated FIO field names",
     )
     mask.add_argument(
+        "--account-keys",
+        default=",".join(DEFAULT_ACCOUNT_KEYS),
+        help="Comma-separated bank account field names",
+    )
+    mask.add_argument(
         "--dry-run", action="store_true", help="Report replacements without writing files"
     )
 
@@ -396,6 +491,7 @@ def main(argv: list[str] | None = None) -> int:
                 ("inn", args.inn_keys),
                 ("kpp", args.kpp_keys),
                 ("fio", args.fio_keys),
+                ("account", args.account_keys),
             ):
                 for key in raw_keys.split(","):
                     if key.strip():
