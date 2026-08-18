@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tokenize sensitive values in JSON/XML files and encrypt the restore manifest."""
+"""Irreversibly depersonalize sensitive values in JSON and XML files."""
 
 from __future__ import annotations
 
@@ -9,13 +9,10 @@ import json
 import os
 import re
 import secrets
-import shutil
 import string
-import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,6 +20,16 @@ from typing import Any, Iterable
 
 TOKEN_ALPHABET = string.ascii_uppercase
 TOKEN_LENGTH = 20
+REPEATED_DIGIT_KINDS = {
+    "phone",
+    "inn",
+    "kpp",
+    "account",
+    "passport_series",
+    "passport_number",
+    "ogrn",
+    "card_number",
+}
 DEFAULT_PHONE_KEYS = ("phone", "phoneNumber", "mobilePhone", "msisdn")
 DEFAULT_INN_KEYS = ("inn", "tax_id")
 DEFAULT_KPP_KEYS = ("kpp",)
@@ -146,8 +153,23 @@ def get_or_create_token(
     registry_key = f"{kind}:{canonical}"
     token = tokens_by_value.get(registry_key)
     if token is None:
-        token = new_token(kind, set(tokens_by_value.values()))
+        if kind in REPEATED_DIGIT_KINDS:
+            token = secrets.choice(string.digits)
+        else:
+            token = new_token(kind, set(tokens_by_value.values()))
         tokens_by_value[registry_key] = token
+    return token
+
+
+def mask_structured_value(
+    kind: str, value: Any, tokens_by_value: dict[str, str]
+) -> str | None:
+    canonical = normalize_sensitive_value(kind, value)
+    if canonical is None:
+        return None
+    token = get_or_create_token(kind, canonical, tokens_by_value)
+    if kind in REPEATED_DIGIT_KINDS:
+        return token * len(str(value))
     return token
 
 
@@ -174,7 +196,7 @@ def mask_embedded_text(
         if not any(address in network for network in PRIVATE_IPV4_NETWORKS):
             return candidate
         match_count += 1
-        return get_or_create_token("ip", str(address), tokens_by_value)
+        return "127.0.0.1"
 
     def replace_user(match: re.Match[str]) -> str:
         nonlocal match_count
@@ -186,20 +208,6 @@ def mask_embedded_text(
     masked = IPV4_PATTERN.sub(replace_ip, masked)
     masked = GPBU_LOGIN_PATTERN.sub(replace_user, masked)
     return masked, match_count
-
-
-def pointer_get(document: Any, pointer: list[str | int]) -> Any:
-    current = document
-    for part in pointer:
-        current = current[part]
-    return current
-
-
-def pointer_set(document: Any, pointer: list[str | int], value: Any) -> None:
-    if not pointer:
-        raise TokenizerError("Replacing the JSON document root is not supported")
-    parent = pointer_get(document, pointer[:-1])
-    parent[pointer[-1]] = value
 
 
 def detect_indent(source: str) -> int:
@@ -224,34 +232,9 @@ def transform_document(
     document: Any,
     field_types: dict[str, str],
     tokens_by_value: dict[str, str],
-    occurrences: list[dict[str, Any]],
-    root_index: int,
-    relative_file: str,
 ) -> int:
-    """Replace configured sensitive fields and append exact restore locations."""
+    """Replace configured sensitive fields irreversibly."""
     replacements = 0
-
-    def token_for(kind: str, canonical: str) -> str:
-        return get_or_create_token(kind, canonical, tokens_by_value)
-
-    def record_occurrence(
-        pointer: list[str | int],
-        kind: str,
-        original: Any,
-        token: Any,
-        count: int = 1,
-    ) -> None:
-        occurrences.append(
-            {
-                "root": root_index,
-                "file": relative_file,
-                "pointer": pointer,
-                "kind": kind,
-                "original": original,
-                "token": token,
-                "count": count,
-            }
-        )
 
     def replace_value(value: Any, pointer: list[str | int], kind: str) -> Any:
         nonlocal replacements
@@ -262,23 +245,17 @@ def transform_document(
                 for index, item in enumerate(value)
             ]
 
-        canonical = normalize_sensitive_value(kind, value)
-        if canonical is None:
+        masked = mask_structured_value(kind, value, tokens_by_value)
+        if masked is None:
             return value
 
-        token = token_for(kind, canonical)
-        record_occurrence(pointer, kind, value, token)
         replacements += 1
-        return token
+        return masked
 
     def replace_embedded(value: str, pointer: list[str | int]) -> str:
         nonlocal replacements
-        original = value
         masked, match_count = mask_embedded_text(value, tokens_by_value)
-        if masked != original:
-            record_occurrence(
-                pointer, "embedded", original, masked, count=match_count
-            )
+        if masked != value:
             replacements += match_count
         return masked
 
@@ -356,46 +333,12 @@ def serialize_xml(document: ET.Element, source: str) -> str:
     return prefix + body + trailing_newline
 
 
-def xml_element_at(document: ET.Element, pointer: list[int]) -> ET.Element:
-    current = document
-    for index in pointer:
-        current = list(current)[index]
-    return current
-
-
 def transform_xml_document(
     document: ET.Element,
     field_types: dict[str, str],
     tokens_by_value: dict[str, str],
-    occurrences: list[dict[str, Any]],
-    root_index: int,
-    relative_file: str,
 ) -> int:
     replacements = 0
-
-    def record_occurrence(
-        pointer: list[int],
-        slot: str,
-        original: str,
-        token: str,
-        kind: str,
-        count: int = 1,
-        attribute: str | None = None,
-    ) -> None:
-        occurrence = {
-            "format": "xml",
-            "root": root_index,
-            "file": relative_file,
-            "pointer": pointer,
-            "slot": slot,
-            "kind": kind,
-            "original": original,
-            "token": token,
-            "count": count,
-        }
-        if attribute is not None:
-            occurrence["attribute"] = attribute
-        occurrences.append(occurrence)
 
     def replace_structured(
         value: str,
@@ -405,13 +348,11 @@ def transform_xml_document(
         attribute: str | None = None,
     ) -> str:
         nonlocal replacements
-        canonical = normalize_sensitive_value(kind, value)
-        if canonical is None:
+        masked = mask_structured_value(kind, value, tokens_by_value)
+        if masked is None:
             return value
-        token = get_or_create_token(kind, canonical, tokens_by_value)
-        record_occurrence(pointer, slot, value, token, kind, attribute=attribute)
         replacements += 1
-        return token
+        return masked
 
     def replace_embedded(
         value: str,
@@ -422,15 +363,6 @@ def transform_xml_document(
         nonlocal replacements
         masked, count = mask_embedded_text(value, tokens_by_value)
         if masked != value:
-            record_occurrence(
-                pointer,
-                slot,
-                value,
-                masked,
-                "embedded",
-                count=count,
-                attribute=attribute,
-            )
             replacements += count
         return masked
 
@@ -521,18 +453,16 @@ def prepare_masking(
     roots: list[Path],
     phone_keys: set[str] | None = None,
     field_types: dict[str, str] | None = None,
-) -> tuple[list[PreparedFile], dict[str, Any], int]:
+) -> tuple[list[PreparedFile], int]:
     if field_types is None:
         field_types = {key.casefold(): "phone" for key in (phone_keys or set())}
     tokens_by_value: dict[str, str] = {}
-    occurrences: list[dict[str, Any]] = []
     prepared: list[PreparedFile] = []
     replacement_count = 0
 
-    for root_index, root in enumerate(roots):
+    for root in roots:
         for path in iter_data_files(root):
             source = path.read_text(encoding="utf-8")
-            relative_file = path.relative_to(root).as_posix()
             if path.suffix.casefold() == ".json":
                 try:
                     document = json.loads(source)
@@ -542,9 +472,6 @@ def prepare_masking(
                     document=document,
                     field_types=field_types,
                     tokens_by_value=tokens_by_value,
-                    occurrences=occurrences,
-                    root_index=root_index,
-                    relative_file=relative_file,
                 )
                 serialized = serialize_json(document, source)
             else:
@@ -553,59 +480,13 @@ def prepare_masking(
                     document=document,
                     field_types=field_types,
                     tokens_by_value=tokens_by_value,
-                    occurrences=occurrences,
-                    root_index=root_index,
-                    relative_file=relative_file,
                 )
                 serialized = serialize_xml(document, source)
             if count:
                 prepared.append(PreparedFile(path, serialized))
                 replacement_count += count
 
-    manifest = {
-        "version": 4,
-        "roots": [root.name for root in roots],
-        "fields": dict(sorted(field_types.items())),
-        "tokens": tokens_by_value,
-        "occurrences": occurrences,
-    }
-    return prepared, manifest, replacement_count
-
-
-def run_age(arguments: list[str], input_data: bytes | None = None) -> bytes:
-    if shutil.which("age") is None:
-        raise TokenizerError("The 'age' executable was not found in PATH")
-    try:
-        process = subprocess.run(
-            ["age", *arguments],
-            input=input_data,
-            capture_output=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as error:
-        message = error.stderr.decode("utf-8", errors="replace").strip()
-        raise TokenizerError(f"age failed: {message}") from error
-    return process.stdout
-
-
-def encrypt_manifest(
-    manifest: dict[str, Any], recipient_file: Path, output_file: Path
-) -> None:
-    if output_file.exists():
-        raise TokenizerError(f"Refusing to overwrite existing {output_file}")
-    payload = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
-    run_age(["-R", str(recipient_file), "-o", str(output_file)], payload)
-
-
-def decrypt_manifest(identity_file: Path, encrypted_file: Path) -> dict[str, Any]:
-    payload = run_age(["-d", "-i", str(identity_file), str(encrypted_file)])
-    try:
-        manifest = json.loads(payload)
-    except json.JSONDecodeError as error:
-        raise TokenizerError("The decrypted manifest is not valid JSON") from error
-    if manifest.get("version") not in (1, 2, 3, 4):
-        raise TokenizerError("Unsupported manifest version")
-    return manifest
+    return prepared, replacement_count
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -628,70 +509,6 @@ def write_prepared_files(prepared: list[PreparedFile]) -> None:
         atomic_write(item.path, item.content)
 
 
-def prepare_restoration(
-    roots: list[Path], manifest: dict[str, Any]
-) -> tuple[list[PreparedFile], int]:
-    expected_roots = manifest.get("roots")
-    actual_roots = [root.name for root in roots]
-    if expected_roots != actual_roots:
-        raise TokenizerError(
-            f"Root order/name mismatch: expected {expected_roots}, got {actual_roots}"
-        )
-
-    grouped: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
-    for occurrence in manifest.get("occurrences", []):
-        grouped[(occurrence["root"], occurrence["file"])].append(occurrence)
-
-    prepared: list[PreparedFile] = []
-    restored_count = 0
-    for (root_index, relative_file), occurrences in grouped.items():
-        path = roots[root_index] / relative_file
-        source = path.read_text(encoding="utf-8")
-        if path.suffix.casefold() == ".xml":
-            document = parse_xml_document(source, path)
-            for occurrence in occurrences:
-                pointer = occurrence["pointer"]
-                element = xml_element_at(document, pointer)
-                slot = occurrence["slot"]
-                if slot == "attribute":
-                    attribute = occurrence["attribute"]
-                    current = element.attrib[attribute]
-                else:
-                    current = getattr(element, slot)
-                if current == occurrence["original"]:
-                    continue
-                if current != occurrence["token"]:
-                    raise TokenizerError(
-                        f"Unexpected XML value at {path}:{pointer}:{slot}; "
-                        "refusing to overwrite it"
-                    )
-                if slot == "attribute":
-                    element.attrib[attribute] = occurrence["original"]
-                else:
-                    setattr(element, slot, occurrence["original"])
-                restored_count += occurrence.get("count", 1)
-            serialized = serialize_xml(document, source)
-        else:
-            document = json.loads(source)
-            for occurrence in occurrences:
-                pointer = occurrence["pointer"]
-                current = pointer_get(document, pointer)
-                if current == occurrence["original"]:
-                    continue
-                if current != occurrence["token"]:
-                    raise TokenizerError(
-                        f"Unexpected value at {path}:{pointer}; "
-                        "refusing to overwrite it"
-                    )
-                pointer_set(document, pointer, occurrence["original"])
-                restored_count += occurrence.get("count", 1)
-            serialized = serialize_json(document, source)
-
-        prepared.append(PreparedFile(path, serialized))
-
-    return prepared, restored_count
-
-
 def existing_directory(value: str) -> Path:
     path = Path(value).resolve()
     if not path.is_dir():
@@ -701,7 +518,7 @@ def existing_directory(value: str) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Tokenize sensitive JSON/XML values and encrypt the restore manifest"
+        description="Irreversibly depersonalize sensitive JSON/XML values"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -709,8 +526,6 @@ def build_parser() -> argparse.ArgumentParser:
         "mask", help="Mask sensitive values in one or more repositories"
     )
     mask.add_argument("roots", nargs="+", type=existing_directory)
-    mask.add_argument("--recipient-file", required=True, type=Path)
-    mask.add_argument("--mapping", required=True, type=Path)
     mask.add_argument(
         "--phone-keys",
         default=",".join(DEFAULT_PHONE_KEYS),
@@ -760,62 +575,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="Report replacements without writing files"
     )
 
-    restore = subparsers.add_parser(
-        "restore", help="Restore original sensitive values"
-    )
-    restore.add_argument("roots", nargs="+", type=existing_directory)
-    restore.add_argument("--identity-file", required=True, type=Path)
-    restore.add_argument("--mapping", required=True, type=Path)
-    restore.add_argument(
-        "--dry-run", action="store_true", help="Validate without writing files"
-    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "mask":
-            field_types: dict[str, str] = {}
-            for kind, raw_keys in (
-                ("phone", args.phone_keys),
-                ("inn", args.inn_keys),
-                ("kpp", args.kpp_keys),
-                ("fio", args.fio_keys),
-                ("account", args.account_keys),
-                ("passport_series", args.passport_series_keys),
-                ("passport_number", args.passport_number_keys),
-                ("ogrn", args.ogrn_keys),
-                ("card_number", args.card_number_keys),
-            ):
-                for key in raw_keys.split(","):
-                    if key.strip():
-                        field_types[key.strip().casefold()] = kind
-            if not field_types:
-                raise TokenizerError("At least one sensitive field key is required")
+        field_types: dict[str, str] = {}
+        for kind, raw_keys in (
+            ("phone", args.phone_keys),
+            ("inn", args.inn_keys),
+            ("kpp", args.kpp_keys),
+            ("fio", args.fio_keys),
+            ("account", args.account_keys),
+            ("passport_series", args.passport_series_keys),
+            ("passport_number", args.passport_number_keys),
+            ("ogrn", args.ogrn_keys),
+            ("card_number", args.card_number_keys),
+        ):
+            for key in raw_keys.split(","):
+                if key.strip():
+                    field_types[key.strip().casefold()] = kind
+        if not field_types:
+            raise TokenizerError("At least one sensitive field key is required")
 
-            prepared, manifest, count = prepare_masking(
-                args.roots, field_types=field_types
+        prepared, count = prepare_masking(args.roots, field_types=field_types)
+        if args.dry_run:
+            print(
+                f"Would replace {count} sensitive value(s) "
+                f"in {len(prepared)} file(s)"
             )
-            if args.dry_run:
-                print(
-                    f"Would replace {count} sensitive value(s) "
-                    f"in {len(prepared)} file(s)"
-                )
-                return 0
-
-            encrypt_manifest(manifest, args.recipient_file, args.mapping)
-            write_prepared_files(prepared)
-            print(f"Replaced {count} sensitive value(s) in {len(prepared)} file(s)")
-            print(f"Encrypted restore manifest: {args.mapping}")
             return 0
 
-        manifest = decrypt_manifest(args.identity_file, args.mapping)
-        prepared, count = prepare_restoration(args.roots, manifest)
-        if not args.dry_run:
-            write_prepared_files(prepared)
-        verb = "Would restore" if args.dry_run else "Restored"
-        print(f"{verb} {count} sensitive value(s) in {len(prepared)} file(s)")
+        write_prepared_files(prepared)
+        print(f"Replaced {count} sensitive value(s) in {len(prepared)} file(s)")
         return 0
     except (OSError, KeyError, IndexError, TypeError, TokenizerError) as error:
         print(f"error: {error}", file=sys.stderr)
