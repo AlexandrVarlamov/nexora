@@ -36,6 +36,8 @@ DEFAULT_ACCOUNT_KEYS = (
 )
 DEFAULT_PASSPORT_SERIES_KEYS = ("passport_series", "passportSeries")
 DEFAULT_PASSPORT_NUMBER_KEYS = ("passport_number", "passportNumber")
+DEFAULT_OGRN_KEYS = ("ogrn", "ogrn_number", "ogrnNumber")
+DEFAULT_CARD_NUMBER_KEYS = ("cardNumber", "card_number")
 TOKEN_PREFIXES = {
     "phone": "PHONE_",
     "inn": "INN_",
@@ -48,6 +50,8 @@ TOKEN_PREFIXES = {
     "user": "USER_",
     "passport_series": "PASSPORT_SERIES_",
     "passport_number": "PASSPORT_NUMBER_",
+    "ogrn": "OGRN_",
+    "card_number": "CARD_",
 }
 EMAIL_PATTERN = re.compile(
     r"(?<![\w.+-])"
@@ -108,10 +112,15 @@ def normalize_sensitive_value(kind: str, value: Any) -> str | None:
         return " ".join(value.split()).casefold()
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
-    if kind in ("passport_series", "passport_number"):
+    if kind in ("passport_series", "passport_number", "ogrn", "card_number"):
         normalized = re.sub(r"[\s-]", "", str(value))
-        expected_length = 4 if kind == "passport_series" else 6
-        return normalized if re.fullmatch(rf"\d{{{expected_length}}}", normalized) else None
+        patterns = {
+            "passport_series": r"\d{4}",
+            "passport_number": r"\d{6}",
+            "ogrn": r"\d{13}",
+            "card_number": r"\d{13,19}",
+        }
+        return normalized if re.fullmatch(patterns[kind], normalized) else None
     normalized = re.sub(r"\s", "", str(value)).casefold()
     if kind == "inn" and not re.fullmatch(r"\d{10}|\d{12}", normalized):
         return None
@@ -495,6 +504,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated passport number field names",
     )
     mask.add_argument(
+        "--ogrn-keys",
+        default=",".join(DEFAULT_OGRN_KEYS),
+        help="Comma-separated OGRN field names",
+    )
+    mask.add_argument(
+        "--card-number-keys",
+        default=",".join(DEFAULT_CARD_NUMBER_KEYS),
+        help="Comma-separated payment card number field names",
+    )
+    mask.add_argument(
         "--dry-run", action="store_true", help="Report replacements without writing files"
     )
 
@@ -523,6 +542,8 @@ def main(argv: list[str] | None = None) -> int:
                 ("account", args.account_keys),
                 ("passport_series", args.passport_series_keys),
                 ("passport_number", args.passport_number_keys),
+                ("ogrn", args.ogrn_keys),
+                ("card_number", args.card_number_keys),
             ):
                 for key in raw_keys.split(","):
                     if key.strip():
