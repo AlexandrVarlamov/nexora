@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tokenize sensitive values in JSON files and encrypt the restore manifest."""
+"""Tokenize sensitive values in JSON/XML files and encrypt the restore manifest."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -139,6 +140,54 @@ def new_token(kind: str, used_tokens: set[str]) -> str:
             return token
 
 
+def get_or_create_token(
+    kind: str, canonical: str, tokens_by_value: dict[str, str]
+) -> str:
+    registry_key = f"{kind}:{canonical}"
+    token = tokens_by_value.get(registry_key)
+    if token is None:
+        token = new_token(kind, set(tokens_by_value.values()))
+        tokens_by_value[registry_key] = token
+    return token
+
+
+def mask_embedded_text(
+    value: str, tokens_by_value: dict[str, str]
+) -> tuple[str, int]:
+    match_count = 0
+
+    def replace_email(match: re.Match[str]) -> str:
+        nonlocal match_count
+        email = match.group(0)
+        domain = email.rsplit("@", 1)[1].casefold()
+        kind = "bank_email" if domain == "int.gazprombank.ru" else "email"
+        match_count += 1
+        return get_or_create_token(kind, email.casefold(), tokens_by_value)
+
+    def replace_ip(match: re.Match[str]) -> str:
+        nonlocal match_count
+        candidate = match.group(0)
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            return candidate
+        if not any(address in network for network in PRIVATE_IPV4_NETWORKS):
+            return candidate
+        match_count += 1
+        return get_or_create_token("ip", str(address), tokens_by_value)
+
+    def replace_user(match: re.Match[str]) -> str:
+        nonlocal match_count
+        login = match.group(0)
+        match_count += 1
+        return get_or_create_token("user", login.casefold(), tokens_by_value)
+
+    masked = EMAIL_PATTERN.sub(replace_email, value)
+    masked = IPV4_PATTERN.sub(replace_ip, masked)
+    masked = GPBU_LOGIN_PATTERN.sub(replace_user, masked)
+    return masked, match_count
+
+
 def pointer_get(document: Any, pointer: list[str | int]) -> Any:
     current = document
     for part in pointer:
@@ -180,17 +229,10 @@ def transform_document(
     relative_file: str,
 ) -> int:
     """Replace configured sensitive fields and append exact restore locations."""
-    used_tokens = set(tokens_by_value.values())
     replacements = 0
 
     def token_for(kind: str, canonical: str) -> str:
-        registry_key = f"{kind}:{canonical}"
-        token = tokens_by_value.get(registry_key)
-        if token is None:
-            token = new_token(kind, used_tokens)
-            used_tokens.add(token)
-            tokens_by_value[registry_key] = token
-        return token
+        return get_or_create_token(kind, canonical, tokens_by_value)
 
     def record_occurrence(
         pointer: list[str | int],
@@ -232,37 +274,7 @@ def transform_document(
     def replace_embedded(value: str, pointer: list[str | int]) -> str:
         nonlocal replacements
         original = value
-        match_count = 0
-
-        def replace_email(match: re.Match[str]) -> str:
-            nonlocal match_count
-            email = match.group(0)
-            domain = email.rsplit("@", 1)[1].casefold()
-            kind = "bank_email" if domain == "int.gazprombank.ru" else "email"
-            match_count += 1
-            return token_for(kind, email.casefold())
-
-        def replace_ip(match: re.Match[str]) -> str:
-            nonlocal match_count
-            candidate = match.group(0)
-            try:
-                address = ipaddress.ip_address(candidate)
-            except ValueError:
-                return candidate
-            if not any(address in network for network in PRIVATE_IPV4_NETWORKS):
-                return candidate
-            match_count += 1
-            return token_for("ip", str(address))
-
-        def replace_user(match: re.Match[str]) -> str:
-            nonlocal match_count
-            login = match.group(0)
-            match_count += 1
-            return token_for("user", login.casefold())
-
-        masked = EMAIL_PATTERN.sub(replace_email, value)
-        masked = IPV4_PATTERN.sub(replace_ip, masked)
-        masked = GPBU_LOGIN_PATTERN.sub(replace_user, masked)
+        masked, match_count = mask_embedded_text(value, tokens_by_value)
         if masked != original:
             record_occurrence(
                 pointer, "embedded", original, masked, count=match_count
@@ -307,9 +319,201 @@ def transform_document(
     return replacements
 
 
-def iter_json_files(root: Path) -> Iterable[Path]:
-    for path in sorted(root.rglob("*.json")):
-        if ".git" not in path.parts and path.is_file() and not path.is_symlink():
+def xml_local_name(name: Any) -> str:
+    if not isinstance(name, str):
+        return ""
+    return name.rsplit("}", 1)[-1].casefold()
+
+
+def parse_xml_document(source: str, path: Path | None = None) -> ET.Element:
+    if re.search(r"<!DOCTYPE", source, re.IGNORECASE):
+        location = f" in {path}" if path else ""
+        raise TokenizerError(f"XML documents with DOCTYPE are not supported{location}")
+
+    for prefix, uri in re.findall(
+        r"""\sxmlns(?::([A-Za-z_][\w.-]*))?=["']([^"']+)["']""", source
+    ):
+        try:
+            ET.register_namespace(prefix or "", uri)
+        except ValueError:
+            pass
+
+    parser = ET.XMLParser(
+        target=ET.TreeBuilder(insert_comments=True, insert_pis=True)
+    )
+    try:
+        return ET.fromstring(source, parser=parser)
+    except ET.ParseError as error:
+        location = f" in {path}" if path else ""
+        raise TokenizerError(f"Invalid XML{location}: {error}") from error
+
+
+def serialize_xml(document: ET.Element, source: str) -> str:
+    body = ET.tostring(document, encoding="unicode", short_empty_elements=True)
+    declaration = re.match(r"\s*(<\?xml[^>]+\?>)(?:\r?\n)?", source)
+    prefix = declaration.group(1) + "\n" if declaration else ""
+    trailing_newline = "\n" if source.endswith("\n") else ""
+    return prefix + body + trailing_newline
+
+
+def xml_element_at(document: ET.Element, pointer: list[int]) -> ET.Element:
+    current = document
+    for index in pointer:
+        current = list(current)[index]
+    return current
+
+
+def transform_xml_document(
+    document: ET.Element,
+    field_types: dict[str, str],
+    tokens_by_value: dict[str, str],
+    occurrences: list[dict[str, Any]],
+    root_index: int,
+    relative_file: str,
+) -> int:
+    replacements = 0
+
+    def record_occurrence(
+        pointer: list[int],
+        slot: str,
+        original: str,
+        token: str,
+        kind: str,
+        count: int = 1,
+        attribute: str | None = None,
+    ) -> None:
+        occurrence = {
+            "format": "xml",
+            "root": root_index,
+            "file": relative_file,
+            "pointer": pointer,
+            "slot": slot,
+            "kind": kind,
+            "original": original,
+            "token": token,
+            "count": count,
+        }
+        if attribute is not None:
+            occurrence["attribute"] = attribute
+        occurrences.append(occurrence)
+
+    def replace_structured(
+        value: str,
+        pointer: list[int],
+        slot: str,
+        kind: str,
+        attribute: str | None = None,
+    ) -> str:
+        nonlocal replacements
+        canonical = normalize_sensitive_value(kind, value)
+        if canonical is None:
+            return value
+        token = get_or_create_token(kind, canonical, tokens_by_value)
+        record_occurrence(pointer, slot, value, token, kind, attribute=attribute)
+        replacements += 1
+        return token
+
+    def replace_embedded(
+        value: str,
+        pointer: list[int],
+        slot: str,
+        attribute: str | None = None,
+    ) -> str:
+        nonlocal replacements
+        masked, count = mask_embedded_text(value, tokens_by_value)
+        if masked != value:
+            record_occurrence(
+                pointer,
+                slot,
+                value,
+                masked,
+                "embedded",
+                count=count,
+                attribute=attribute,
+            )
+            replacements += count
+        return masked
+
+    def walk(
+        element: ET.Element,
+        pointer: list[int],
+        forced_kind: str | None = None,
+    ) -> None:
+        document_type = ""
+        for attribute_name, attribute_value in element.attrib.items():
+            if xml_local_name(attribute_name) == "type":
+                document_type = attribute_value.casefold()
+                break
+        if not document_type:
+            for child in element:
+                if xml_local_name(child.tag) == "type" and child.text:
+                    document_type = child.text.strip().casefold()
+                    break
+
+        element_name = xml_local_name(element.tag)
+        is_passport = document_type in {
+            "passport",
+            "passport_rf",
+            "russian_passport",
+        } or element_name in {"passport", "passport_data"}
+
+        for attribute_name, attribute_value in list(element.attrib.items()):
+            attribute_local_name = xml_local_name(attribute_name)
+            kind = field_types.get(attribute_local_name)
+            if is_passport and attribute_local_name == "series":
+                kind = "passport_series"
+            elif is_passport and attribute_local_name == "number":
+                kind = "passport_number"
+            if kind:
+                element.attrib[attribute_name] = replace_structured(
+                    attribute_value,
+                    pointer,
+                    "attribute",
+                    kind,
+                    attribute=attribute_name,
+                )
+            else:
+                element.attrib[attribute_name] = replace_embedded(
+                    attribute_value,
+                    pointer,
+                    "attribute",
+                    attribute=attribute_name,
+                )
+
+        kind = forced_kind or field_types.get(element_name)
+        if element.text is not None:
+            if kind:
+                element.text = replace_structured(
+                    element.text, pointer, "text", kind
+                )
+            else:
+                element.text = replace_embedded(element.text, pointer, "text")
+
+        for index, child in enumerate(element):
+            child_name = xml_local_name(child.tag)
+            child_kind = None
+            if is_passport and child_name == "series":
+                child_kind = "passport_series"
+            elif is_passport and child_name == "number":
+                child_kind = "passport_number"
+            walk(child, pointer + [index], forced_kind=child_kind)
+            if child.tail is not None:
+                child.tail = replace_embedded(
+                    child.tail, pointer + [index], "tail"
+                )
+
+    walk(document, [])
+    return replacements
+
+
+def iter_data_files(root: Path) -> Iterable[Path]:
+    for path in sorted(root.rglob("*")):
+        if (
+            path.suffix.casefold() in {".json", ".xml"}
+            and ".git" not in path.parts
+            and path.is_file()
+            and not path.is_symlink()
+        ):
             yield path
 
 
@@ -326,27 +530,40 @@ def prepare_masking(
     replacement_count = 0
 
     for root_index, root in enumerate(roots):
-        for path in iter_json_files(root):
+        for path in iter_data_files(root):
             source = path.read_text(encoding="utf-8")
-            try:
-                document = json.loads(source)
-            except json.JSONDecodeError as error:
-                raise TokenizerError(f"Invalid JSON in {path}: {error}") from error
-
-            count = transform_document(
-                document=document,
-                field_types=field_types,
-                tokens_by_value=tokens_by_value,
-                occurrences=occurrences,
-                root_index=root_index,
-                relative_file=path.relative_to(root).as_posix(),
-            )
+            relative_file = path.relative_to(root).as_posix()
+            if path.suffix.casefold() == ".json":
+                try:
+                    document = json.loads(source)
+                except json.JSONDecodeError as error:
+                    raise TokenizerError(f"Invalid JSON in {path}: {error}") from error
+                count = transform_document(
+                    document=document,
+                    field_types=field_types,
+                    tokens_by_value=tokens_by_value,
+                    occurrences=occurrences,
+                    root_index=root_index,
+                    relative_file=relative_file,
+                )
+                serialized = serialize_json(document, source)
+            else:
+                document = parse_xml_document(source, path)
+                count = transform_xml_document(
+                    document=document,
+                    field_types=field_types,
+                    tokens_by_value=tokens_by_value,
+                    occurrences=occurrences,
+                    root_index=root_index,
+                    relative_file=relative_file,
+                )
+                serialized = serialize_xml(document, source)
             if count:
-                prepared.append(PreparedFile(path, serialize_json(document, source)))
+                prepared.append(PreparedFile(path, serialized))
                 replacement_count += count
 
     manifest = {
-        "version": 3,
+        "version": 4,
         "roots": [root.name for root in roots],
         "fields": dict(sorted(field_types.items())),
         "tokens": tokens_by_value,
@@ -386,7 +603,7 @@ def decrypt_manifest(identity_file: Path, encrypted_file: Path) -> dict[str, Any
         manifest = json.loads(payload)
     except json.JSONDecodeError as error:
         raise TokenizerError("The decrypted manifest is not valid JSON") from error
-    if manifest.get("version") not in (1, 2, 3):
+    if manifest.get("version") not in (1, 2, 3, 4):
         raise TokenizerError("Unsupported manifest version")
     return manifest
 
@@ -430,21 +647,47 @@ def prepare_restoration(
     for (root_index, relative_file), occurrences in grouped.items():
         path = roots[root_index] / relative_file
         source = path.read_text(encoding="utf-8")
-        document = json.loads(source)
+        if path.suffix.casefold() == ".xml":
+            document = parse_xml_document(source, path)
+            for occurrence in occurrences:
+                pointer = occurrence["pointer"]
+                element = xml_element_at(document, pointer)
+                slot = occurrence["slot"]
+                if slot == "attribute":
+                    attribute = occurrence["attribute"]
+                    current = element.attrib[attribute]
+                else:
+                    current = getattr(element, slot)
+                if current == occurrence["original"]:
+                    continue
+                if current != occurrence["token"]:
+                    raise TokenizerError(
+                        f"Unexpected XML value at {path}:{pointer}:{slot}; "
+                        "refusing to overwrite it"
+                    )
+                if slot == "attribute":
+                    element.attrib[attribute] = occurrence["original"]
+                else:
+                    setattr(element, slot, occurrence["original"])
+                restored_count += occurrence.get("count", 1)
+            serialized = serialize_xml(document, source)
+        else:
+            document = json.loads(source)
+            for occurrence in occurrences:
+                pointer = occurrence["pointer"]
+                current = pointer_get(document, pointer)
+                if current == occurrence["original"]:
+                    continue
+                if current != occurrence["token"]:
+                    raise TokenizerError(
+                        f"Unexpected value at {path}:{pointer}; "
+                        "refusing to overwrite it"
+                    )
+                pointer_set(document, pointer, occurrence["original"])
+                restored_count += occurrence.get("count", 1)
+            serialized = serialize_json(document, source)
 
-        for occurrence in occurrences:
-            pointer = occurrence["pointer"]
-            current = pointer_get(document, pointer)
-            if current == occurrence["original"]:
-                continue
-            if current != occurrence["token"]:
-                raise TokenizerError(
-                    f"Unexpected value at {path}:{pointer}; refusing to overwrite it"
-                )
-            pointer_set(document, pointer, occurrence["original"])
-            restored_count += occurrence.get("count", 1)
-
-        prepared.append(PreparedFile(path, serialize_json(document, source)))
+        prepared.append(PreparedFile(path, serialized))
 
     return prepared, restored_count
 
@@ -458,7 +701,7 @@ def existing_directory(value: str) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Tokenize sensitive JSON fields and encrypt the restore manifest"
+        description="Tokenize sensitive JSON/XML values and encrypt the restore manifest"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -471,7 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
     mask.add_argument(
         "--phone-keys",
         default=",".join(DEFAULT_PHONE_KEYS),
-        help="Comma-separated JSON field names",
+        help="Comma-separated JSON/XML field names",
     )
     mask.add_argument(
         "--inn-keys",
