@@ -439,14 +439,20 @@ def transform_xml_document(
 
 
 def iter_data_files(root: Path) -> Iterable[Path]:
-    for path in sorted(root.rglob("*")):
-        if (
-            path.suffix.casefold() in {".json", ".xml"}
-            and ".git" not in path.parts
-            and path.is_file()
-            and not path.is_symlink()
-        ):
-            yield path
+    ignored_directories = {".git", ".idea"}
+    for current_directory, directory_names, file_names in os.walk(root):
+        directory_names[:] = sorted(
+            name for name in directory_names if name not in ignored_directories
+        )
+        current_path = Path(current_directory)
+        for file_name in sorted(file_names):
+            path = current_path / file_name
+            if (
+                path.suffix.casefold() in {".json", ".xml"}
+                and path.is_file()
+                and not path.is_symlink()
+            ):
+                yield path
 
 
 def prepare_masking(
