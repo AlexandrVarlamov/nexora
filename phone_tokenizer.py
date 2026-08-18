@@ -34,6 +34,8 @@ DEFAULT_ACCOUNT_KEYS = (
     "payerAccount",
     "recipientAccount",
 )
+DEFAULT_PASSPORT_SERIES_KEYS = ("passport_series", "passportSeries")
+DEFAULT_PASSPORT_NUMBER_KEYS = ("passport_number", "passportNumber")
 TOKEN_PREFIXES = {
     "phone": "PHONE_",
     "inn": "INN_",
@@ -44,6 +46,8 @@ TOKEN_PREFIXES = {
     "email": "EMAIL_",
     "ip": "IP_",
     "user": "USER_",
+    "passport_series": "PASSPORT_SERIES_",
+    "passport_number": "PASSPORT_NUMBER_",
 }
 EMAIL_PATTERN = re.compile(
     r"(?<![\w.+-])"
@@ -104,6 +108,10 @@ def normalize_sensitive_value(kind: str, value: Any) -> str | None:
         return " ".join(value.split()).casefold()
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
+    if kind in ("passport_series", "passport_number"):
+        normalized = re.sub(r"[\s-]", "", str(value))
+        expected_length = 4 if kind == "passport_series" else 6
+        return normalized if re.fullmatch(rf"\d{{{expected_length}}}", normalized) else None
     normalized = re.sub(r"\s", "", str(value)).casefold()
     if kind == "inn" and not re.fullmatch(r"\d{10}|\d{12}", normalized):
         return None
@@ -256,9 +264,20 @@ def transform_document(
     def walk(value: Any, pointer: list[str | int]) -> Any:
         if isinstance(value, dict):
             result: dict[str, Any] = {}
+            document_type = str(value.get("type", "")).casefold()
+            parent_key = str(pointer[-1]).casefold() if pointer else ""
+            is_passport = document_type in {
+                "passport",
+                "passport_rf",
+                "russian_passport",
+            } or parent_key in {"passport", "passport_data"}
             for key, child in value.items():
                 child_pointer = pointer + [key]
                 kind = field_types.get(key.casefold())
+                if is_passport and key.casefold() == "series":
+                    kind = "passport_series"
+                elif is_passport and key.casefold() == "number":
+                    kind = "passport_number"
                 if kind:
                     result[key] = replace_value(child, child_pointer, kind)
                 else:
@@ -466,6 +485,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated bank account field names",
     )
     mask.add_argument(
+        "--passport-series-keys",
+        default=",".join(DEFAULT_PASSPORT_SERIES_KEYS),
+        help="Comma-separated passport series field names",
+    )
+    mask.add_argument(
+        "--passport-number-keys",
+        default=",".join(DEFAULT_PASSPORT_NUMBER_KEYS),
+        help="Comma-separated passport number field names",
+    )
+    mask.add_argument(
         "--dry-run", action="store_true", help="Report replacements without writing files"
     )
 
@@ -492,6 +521,8 @@ def main(argv: list[str] | None = None) -> int:
                 ("kpp", args.kpp_keys),
                 ("fio", args.fio_keys),
                 ("account", args.account_keys),
+                ("passport_series", args.passport_series_keys),
+                ("passport_number", args.passport_number_keys),
             ):
                 for key in raw_keys.split(","):
                     if key.strip():
