@@ -977,24 +977,73 @@ def insert_expression_groups(
             return []
 
     depth = 0
+    case_depth = 0
+    top_level_commas = 0
+    previous_significant: SqlToken | None = None
     end = statement_end
     for index in range(start, statement_end):
         token = tokens[index]
+        if token.kind in SQL_TRIVIA_KINDS:
+            continue
         if token.kind == "symbol":
             token_text = sql_token_text(source, token)
             if token_text == "(":
                 depth += 1
             elif token_text == ")":
                 depth -= 1
-        elif depth == 0 and (
-            sql_word(source, token, "from")
-            or sql_word(source, token, "union")
-            or sql_word(source, token, "intersect")
-            or sql_word(source, token, "except")
-            or sql_word(source, token, "returning")
-        ):
-            end = index
-            break
+            elif token_text == "," and depth == 0 and case_depth == 0:
+                top_level_commas += 1
+        elif depth == 0:
+            if sql_word(source, token, "case"):
+                case_depth += 1
+            elif sql_word(source, token, "end") and case_depth:
+                case_depth -= 1
+            elif case_depth == 0 and (
+                sql_word(source, token, "from")
+                or sql_word(source, token, "union")
+                or sql_word(source, token, "intersect")
+                or sql_word(source, token, "except")
+                or sql_word(source, token, "returning")
+            ):
+                end = index
+                break
+            elif (
+                case_depth == 0
+                and top_level_commas >= column_count - 1
+                and previous_significant is not None
+                and "\n"
+                in source[previous_significant.end : token.start]
+                and any(
+                    sql_word(source, token, keyword)
+                    for keyword in {
+                        "insert",
+                        "select",
+                        "update",
+                        "delete",
+                        "merge",
+                        "if",
+                        "else",
+                        "begin",
+                        "end",
+                        "set",
+                        "declare",
+                        "exec",
+                        "execute",
+                        "create",
+                        "alter",
+                        "drop",
+                        "truncate",
+                        "print",
+                        "return",
+                        "throw",
+                        "raiserror",
+                        "with",
+                    }
+                )
+            ):
+                end = index
+                break
+        previous_significant = token
     expressions = split_sql_expressions(source, tokens, start, end)
     if len(expressions) != column_count:
         has_literal = any(
