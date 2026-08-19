@@ -87,18 +87,17 @@ class TokenizerError(RuntimeError):
     """Raised when depersonalization cannot be completed safely."""
 
 
-@dataclass
+@dataclass(slots=True)
 class PreparedFile:
     path: Path
-    content: str
+    temporary_path: Path
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SqlToken:
     kind: str
     start: int
     end: int
-    text: str
 
 
 SQL_TRIVIA_KINDS = {"whitespace", "line_comment", "block_comment"}
@@ -110,7 +109,7 @@ def tokenize_postgresql(source: str, path: Path | None = None) -> list[SqlToken]
     length = len(source)
 
     def add(kind: str, start: int, end: int) -> None:
-        tokens.append(SqlToken(kind, start, end, source[start:end]))
+        tokens.append(SqlToken(kind, start, end))
 
     while index < length:
         start = index
@@ -236,6 +235,123 @@ def sql_location(source: str, offset: int, path: Path | None) -> str:
     line = source.count("\n", 0, offset) + 1
     prefix = f" in {path}" if path else ""
     return f"{prefix} at line {line}"
+
+
+def sql_token_text(source: str, token: SqlToken) -> str:
+    return source[token.start : token.end]
+
+
+def iter_postgresql_statements(stream: Any) -> Iterable[str]:
+    parts: list[str] = []
+    state = "normal"
+    block_depth = 0
+    dollar_delimiter = ""
+    escape_string = False
+
+    for line in stream:
+        segment_start = 0
+        index = 0
+        while index < len(line):
+            if state == "line_comment":
+                newline = line.find("\n", index)
+                if newline == -1:
+                    index = len(line)
+                    continue
+                index = newline + 1
+                state = "normal"
+                continue
+
+            if state == "block_comment":
+                if line.startswith("/*", index):
+                    block_depth += 1
+                    index += 2
+                elif line.startswith("*/", index):
+                    block_depth -= 1
+                    index += 2
+                    if block_depth == 0:
+                        state = "normal"
+                else:
+                    index += 1
+                continue
+
+            if state == "single_quote":
+                if escape_string and line[index] == "\\":
+                    index += 2
+                elif line[index] != "'":
+                    index += 1
+                elif index + 1 < len(line) and line[index + 1] == "'":
+                    index += 2
+                else:
+                    index += 1
+                    state = "normal"
+                continue
+
+            if state == "double_quote":
+                if line[index] != '"':
+                    index += 1
+                elif index + 1 < len(line) and line[index + 1] == '"':
+                    index += 2
+                else:
+                    index += 1
+                    state = "normal"
+                continue
+
+            if state == "dollar_quote":
+                close = line.find(dollar_delimiter, index)
+                if close == -1:
+                    index = len(line)
+                else:
+                    index = close + len(dollar_delimiter)
+                    state = "normal"
+                continue
+
+            if line.startswith("--", index):
+                state = "line_comment"
+                index += 2
+                continue
+            if line.startswith("/*", index):
+                state = "block_comment"
+                block_depth = 1
+                index += 2
+                continue
+            if line[index] == "'":
+                prefix = line[max(0, index - 2) : index]
+                escape_string = (
+                    prefix.endswith(("e", "E"))
+                    and (len(prefix) == 1 or not prefix[-2].isalnum())
+                )
+                state = "single_quote"
+                index += 1
+                continue
+            if line[index] == '"':
+                state = "double_quote"
+                index += 1
+                continue
+            if line[index] == "$":
+                delimiter_match = re.match(
+                    r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", line[index:]
+                )
+                if delimiter_match:
+                    dollar_delimiter = delimiter_match.group(0)
+                    state = "dollar_quote"
+                    index += len(dollar_delimiter)
+                    continue
+            if line[index] == ";":
+                parts.append(line[segment_start : index + 1])
+                statement = "".join(parts)
+                parts.clear()
+                segment_start = index + 1
+                yield statement
+            index += 1
+
+        if state == "line_comment":
+            state = "normal"
+        parts.append(line[segment_start:])
+
+    if parts:
+        trailing = "".join(parts)
+        if trailing:
+            yield trailing
 
 
 def normalize_phone(value: Any) -> str | None:
@@ -594,19 +710,24 @@ def next_sql_token(tokens: list[SqlToken], index: int) -> int | None:
     return None
 
 
-def sql_word(token: SqlToken, value: str) -> bool:
-    return token.kind == "word" and token.text.casefold() == value.casefold()
+def sql_word(source: str, token: SqlToken, value: str) -> bool:
+    return token.kind == "word" and sql_token_text(
+        source, token
+    ).casefold() == value.casefold()
 
 
-def matching_sql_parenthesis(tokens: list[SqlToken], opening: int) -> int:
+def matching_sql_parenthesis(
+    source: str, tokens: list[SqlToken], opening: int
+) -> int:
     depth = 0
     for index in range(opening, len(tokens)):
         token = tokens[index]
         if token.kind != "symbol":
             continue
-        if token.text == "(":
+        token_text = sql_token_text(source, token)
+        if token_text == "(":
             depth += 1
-        elif token.text == ")":
+        elif token_text == ")":
             depth -= 1
             if depth == 0:
                 return index
@@ -614,7 +735,7 @@ def matching_sql_parenthesis(tokens: list[SqlToken], opening: int) -> int:
 
 
 def split_sql_expressions(
-    tokens: list[SqlToken], start: int, end: int
+    source: str, tokens: list[SqlToken], start: int, end: int
 ) -> list[tuple[int, int]]:
     expressions: list[tuple[int, int]] = []
     expression_start = start
@@ -623,40 +744,48 @@ def split_sql_expressions(
         token = tokens[index]
         if token.kind != "symbol":
             continue
-        if token.text == "(":
+        token_text = sql_token_text(source, token)
+        if token_text == "(":
             depth += 1
-        elif token.text == ")":
+        elif token_text == ")":
             depth -= 1
-        elif token.text == "," and depth == 0:
+        elif token_text == "," and depth == 0:
             expressions.append((expression_start, index))
             expression_start = index + 1
     expressions.append((expression_start, end))
     return expressions
 
 
-def decode_sql_identifier(token: SqlToken) -> str:
+def decode_sql_identifier(source: str, token: SqlToken) -> str:
+    token_text = sql_token_text(source, token)
     if token.kind == "quoted_identifier":
-        return token.text[1:-1].replace('""', '"')
-    return token.text
+        return token_text[1:-1].replace('""', '"')
+    return token_text
 
 
-def decode_sql_literal(token: SqlToken) -> str:
+def decode_sql_literal(source: str, token: SqlToken) -> str:
+    token_text = sql_token_text(source, token)
     if token.kind == "string":
-        return token.text[1:-1].replace("''", "'")
+        return token_text[1:-1].replace("''", "'")
     if token.kind == "dollar_string":
-        delimiter_match = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", token.text)
+        delimiter_match = re.match(
+            r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", token_text
+        )
         if not delimiter_match:
-            return token.text
+            return token_text
         delimiter = delimiter_match.group(0)
-        return token.text[len(delimiter) : -len(delimiter)]
-    return token.text
+        return token_text[len(delimiter) : -len(delimiter)]
+    return token_text
 
 
-def encode_sql_literal(token: SqlToken, value: str) -> str:
+def encode_sql_literal(source: str, token: SqlToken, value: str) -> str:
     if token.kind == "string":
         return "'" + value.replace("'", "''") + "'"
     if token.kind == "dollar_string":
-        delimiter_match = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", token.text)
+        delimiter_match = re.match(
+            r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$",
+            sql_token_text(source, token),
+        )
         delimiter = delimiter_match.group(0) if delimiter_match else "$$"
         return delimiter + value + delimiter
     return "'" + value.replace("'", "''") + "'"
@@ -672,17 +801,18 @@ def significant_sql_tokens(
     ]
 
 
-def sql_statement_end(tokens: list[SqlToken], start: int) -> int:
+def sql_statement_end(source: str, tokens: list[SqlToken], start: int) -> int:
     depth = 0
     for index in range(start, len(tokens)):
         token = tokens[index]
         if token.kind != "symbol":
             continue
-        if token.text == "(":
+        token_text = sql_token_text(source, token)
+        if token_text == "(":
             depth += 1
-        elif token.text == ")":
+        elif token_text == ")":
             depth = max(depth - 1, 0)
-        elif token.text == ";" and depth == 0:
+        elif token_text == ";" and depth == 0:
             return index
     return len(tokens)
 
@@ -694,21 +824,21 @@ def parse_insert_columns(
     insert_index: int,
 ) -> tuple[list[str], int, int]:
     into_index = next_sql_token(tokens, insert_index + 1)
-    if into_index is None or not sql_word(tokens[into_index], "into"):
+    if into_index is None or not sql_word(source, tokens[into_index], "into"):
         raise TokenizerError(
             f"Unsupported INSERT syntax"
             f"{sql_location(source, tokens[insert_index].start, path)}"
         )
 
-    statement_end = sql_statement_end(tokens, insert_index)
+    statement_end = sql_statement_end(source, tokens, insert_index)
     index = next_sql_token(tokens, into_index + 1)
     opening = None
     while index is not None and index < statement_end:
         token = tokens[index]
-        if token.kind == "symbol" and token.text == "(":
+        if token.kind == "symbol" and sql_token_text(source, token) == "(":
             opening = index
             break
-        if sql_word(token, "values") or sql_word(token, "select"):
+        if sql_word(source, token, "values") or sql_word(source, token, "select"):
             break
         index = next_sql_token(tokens, index + 1)
 
@@ -718,8 +848,8 @@ def parse_insert_columns(
             f"{sql_location(source, tokens[insert_index].start, path)}"
         )
 
-    closing = matching_sql_parenthesis(tokens, opening)
-    column_ranges = split_sql_expressions(tokens, opening + 1, closing)
+    closing = matching_sql_parenthesis(source, tokens, opening)
+    column_ranges = split_sql_expressions(source, tokens, opening + 1, closing)
     columns: list[str] = []
     for start, end in column_ranges:
         indexes = significant_sql_tokens(tokens, start, end)
@@ -733,19 +863,23 @@ def parse_insert_columns(
                 f"Unsupported target column syntax"
                 f"{sql_location(source, tokens[start].start, path)}"
             )
-        columns.append(decode_sql_identifier(identifiers[0]).casefold())
+        columns.append(
+            decode_sql_identifier(source, identifiers[0]).casefold()
+        )
 
     source_index = next_sql_token(tokens, closing + 1)
     depth = 0
     while source_index is not None and source_index < statement_end:
         token = tokens[source_index]
         if token.kind == "symbol":
-            if token.text == "(":
+            token_text = sql_token_text(source, token)
+            if token_text == "(":
                 depth += 1
-            elif token.text == ")":
+            elif token_text == ")":
                 depth = max(depth - 1, 0)
         elif depth == 0 and (
-            sql_word(token, "values") or sql_word(token, "select")
+            sql_word(source, token, "values")
+            or sql_word(source, token, "select")
         ):
             break
         source_index = next_sql_token(tokens, source_index + 1)
@@ -765,23 +899,30 @@ def insert_expression_groups(
     statement_end: int,
     column_count: int,
 ) -> list[list[tuple[int, int]]]:
-    if sql_word(tokens[source_index], "values"):
+    if sql_word(source, tokens[source_index], "values"):
         groups: list[list[tuple[int, int]]] = []
         index = next_sql_token(tokens, source_index + 1)
         while index is not None and index < statement_end:
             token = tokens[index]
-            if sql_word(token, "on") or sql_word(token, "returning"):
+            if sql_word(source, token, "on") or sql_word(
+                source, token, "returning"
+            ):
                 break
-            if token.kind == "symbol" and token.text == ",":
+            if token.kind == "symbol" and sql_token_text(source, token) == ",":
                 index = next_sql_token(tokens, index + 1)
                 continue
-            if token.kind != "symbol" or token.text != "(":
+            if (
+                token.kind != "symbol"
+                or sql_token_text(source, token) != "("
+            ):
                 raise TokenizerError(
                     f"Unsupported INSERT VALUES syntax"
                     f"{sql_location(source, token.start, path)}"
                 )
-            closing = matching_sql_parenthesis(tokens, index)
-            expressions = split_sql_expressions(tokens, index + 1, closing)
+            closing = matching_sql_parenthesis(source, tokens, index)
+            expressions = split_sql_expressions(
+                source, tokens, index + 1, closing
+            )
             if len(expressions) != column_count:
                 raise TokenizerError(
                     f"INSERT has {column_count} target columns but "
@@ -795,7 +936,9 @@ def insert_expression_groups(
     start = next_sql_token(tokens, source_index + 1)
     if start is None:
         return []
-    if sql_word(tokens[start], "distinct") or sql_word(tokens[start], "all"):
+    if sql_word(source, tokens[start], "distinct") or sql_word(
+        source, tokens[start], "all"
+    ):
         start = next_sql_token(tokens, start + 1)
         if start is None:
             return []
@@ -805,20 +948,21 @@ def insert_expression_groups(
     for index in range(start, statement_end):
         token = tokens[index]
         if token.kind == "symbol":
-            if token.text == "(":
+            token_text = sql_token_text(source, token)
+            if token_text == "(":
                 depth += 1
-            elif token.text == ")":
+            elif token_text == ")":
                 depth -= 1
         elif depth == 0 and (
-            sql_word(token, "from")
-            or sql_word(token, "union")
-            or sql_word(token, "intersect")
-            or sql_word(token, "except")
-            or sql_word(token, "returning")
+            sql_word(source, token, "from")
+            or sql_word(source, token, "union")
+            or sql_word(source, token, "intersect")
+            or sql_word(source, token, "except")
+            or sql_word(source, token, "returning")
         ):
             end = index
             break
-    expressions = split_sql_expressions(tokens, start, end)
+    expressions = split_sql_expressions(source, tokens, start, end)
     if len(expressions) != column_count:
         has_literal = any(
             tokens[index].kind in {"string", "dollar_string", "number"}
@@ -846,10 +990,12 @@ def transform_sql_document(
     replacement_count = 0
 
     for insert_index, token in enumerate(tokens):
-        if not sql_word(token, "insert"):
+        if not sql_word(source, token, "insert"):
             continue
         into_index = next_sql_token(tokens, insert_index + 1)
-        if into_index is None or not sql_word(tokens[into_index], "into"):
+        if into_index is None or not sql_word(
+            source, tokens[into_index], "into"
+        ):
             continue
         columns, source_index, statement_end = parse_insert_columns(
             source, path, tokens, insert_index
@@ -874,7 +1020,7 @@ def transform_sql_document(
                 ]
                 for literal_index in literal_indexes:
                     literal = tokens[literal_index]
-                    original = decode_sql_literal(literal)
+                    original = decode_sql_literal(source, literal)
                     masked = mask_structured_value(
                         kind, original, tokens_by_value
                     )
@@ -882,7 +1028,7 @@ def transform_sql_document(
                         continue
                     replacements[literal.start] = (
                         literal.end,
-                        encode_sql_literal(literal, masked),
+                        encode_sql_literal(source, literal, masked),
                     )
                     replacement_count += 1
 
@@ -891,20 +1037,27 @@ def transform_sql_document(
             continue
         if token.start in replacements:
             continue
-        original = decode_sql_literal(token)
+        original = decode_sql_literal(source, token)
         masked, count = mask_embedded_text(original, tokens_by_value)
         if masked != original:
             replacements[token.start] = (
                 token.end,
-                encode_sql_literal(token, masked),
+                encode_sql_literal(source, token, masked),
             )
             replacement_count += count
 
-    result = source
-    for start in sorted(replacements, reverse=True):
+    if not replacements:
+        return source, replacement_count
+
+    parts: list[str] = []
+    cursor = 0
+    for start in sorted(replacements):
         end, replacement = replacements[start]
-        result = result[:start] + replacement + result[end:]
-    return result, replacement_count
+        parts.append(source[cursor:start])
+        parts.append(replacement)
+        cursor = end
+    parts.append(source[cursor:])
+    return "".join(parts), replacement_count
 
 
 def iter_data_files(root: Path) -> Iterable[Path]:
@@ -924,6 +1077,42 @@ def iter_data_files(root: Path) -> Iterable[Path]:
                 yield path
 
 
+def prepare_sql_file(
+    path: Path,
+    field_types: dict[str, str],
+    tokens_by_value: dict[str, str],
+) -> tuple[PreparedFile | None, int]:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary_name)
+    replacement_count = 0
+    try:
+        with path.open("r", encoding="utf-8", newline="") as source_stream:
+            with os.fdopen(
+                descriptor, "w", encoding="utf-8", newline=""
+            ) as output_stream:
+                for statement in iter_postgresql_statements(source_stream):
+                    masked, count = transform_sql_document(
+                        statement, path, field_types, tokens_by_value
+                    )
+                    output_stream.write(masked)
+                    replacement_count += count
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+        if replacement_count == 0:
+            temporary_path.unlink(missing_ok=True)
+            return None, 0
+        return PreparedFile(path=path, temporary_path=temporary_path), replacement_count
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def prepare_masking(
     roots: list[Path],
     phone_keys: set[str] | None = None,
@@ -935,40 +1124,51 @@ def prepare_masking(
     prepared: list[PreparedFile] = []
     replacement_count = 0
 
-    for root in roots:
-        for path in iter_data_files(root):
-            source = path.read_text(encoding="utf-8")
-            if path.suffix.casefold() == ".json":
-                try:
-                    document = json.loads(source)
-                except json.JSONDecodeError as error:
-                    raise TokenizerError(f"Invalid JSON in {path}: {error}") from error
-                count = transform_document(
-                    document=document,
-                    field_types=field_types,
-                    tokens_by_value=tokens_by_value,
-                )
-                serialized = serialize_json(document, source)
-            elif path.suffix.casefold() == ".xml":
-                document = parse_xml_document(source, path)
-                count = transform_xml_document(
-                    document=document,
-                    field_types=field_types,
-                    tokens_by_value=tokens_by_value,
-                )
-                serialized = serialize_xml(document, source)
-            else:
-                serialized, count = transform_sql_document(
-                    source, path, field_types, tokens_by_value
-                )
-            if count:
-                prepared.append(PreparedFile(path, serialized))
-                replacement_count += count
+    try:
+        for root in roots:
+            for path in iter_data_files(root):
+                if path.suffix.casefold() == ".sql":
+                    prepared_sql, count = prepare_sql_file(
+                        path, field_types, tokens_by_value
+                    )
+                    if prepared_sql is not None:
+                        prepared.append(prepared_sql)
+                        replacement_count += count
+                    continue
+
+                source = path.read_text(encoding="utf-8")
+                if path.suffix.casefold() == ".json":
+                    try:
+                        document = json.loads(source)
+                    except json.JSONDecodeError as error:
+                        raise TokenizerError(
+                            f"Invalid JSON in {path}: {error}"
+                        ) from error
+                    count = transform_document(
+                        document=document,
+                        field_types=field_types,
+                        tokens_by_value=tokens_by_value,
+                    )
+                    serialized = serialize_json(document, source)
+                else:
+                    document = parse_xml_document(source, path)
+                    count = transform_xml_document(
+                        document=document,
+                        field_types=field_types,
+                        tokens_by_value=tokens_by_value,
+                    )
+                    serialized = serialize_xml(document, source)
+                if count:
+                    prepared.append(prepare_content_file(path, serialized))
+                    replacement_count += count
+    except BaseException:
+        discard_prepared_files(prepared)
+        raise
 
     return prepared, replacement_count
 
 
-def atomic_write(path: Path, content: str) -> None:
+def prepare_content_file(path: Path, content: str) -> PreparedFile:
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
@@ -978,14 +1178,23 @@ def atomic_write(path: Path, content: str) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
-    finally:
+        return PreparedFile(path=path, temporary_path=temporary_path)
+    except BaseException:
         temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def write_prepared_files(prepared: list[PreparedFile]) -> None:
+    try:
+        for item in prepared:
+            os.replace(item.temporary_path, item.path)
+    finally:
+        discard_prepared_files(prepared)
+
+
+def discard_prepared_files(prepared: list[PreparedFile]) -> None:
     for item in prepared:
-        atomic_write(item.path, item.content)
+        item.temporary_path.unlink(missing_ok=True)
 
 
 def existing_directory(value: str) -> Path:
@@ -1084,6 +1293,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"Would replace {count} sensitive value(s) "
                 f"in {len(prepared)} file(s)"
             )
+            discard_prepared_files(prepared)
             return 0
 
         write_prepared_files(prepared)
