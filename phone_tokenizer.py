@@ -192,6 +192,25 @@ def tokenize_postgresql(source: str, path: Path | None = None) -> list[SqlToken]
             add("quoted_identifier", start, index)
             continue
 
+        if character == "[":
+            index += 1
+            while index < length:
+                if source[index] != "]":
+                    index += 1
+                    continue
+                if index + 1 < length and source[index + 1] == "]":
+                    index += 2
+                    continue
+                index += 1
+                break
+            else:
+                raise TokenizerError(
+                    f"Unterminated bracketed SQL identifier"
+                    f"{sql_location(source, start, path)}"
+                )
+            add("bracket_identifier", start, index)
+            continue
+
         if character == "$":
             delimiter_match = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", source[index:])
             if delimiter_match:
@@ -249,6 +268,15 @@ def iter_postgresql_statements(stream: Any) -> Iterable[str]:
     escape_string = False
 
     for line in stream:
+        if state == "normal" and re.fullmatch(
+            r"\s*GO(?:\s*--[^\r\n]*)?\s*(?:\r?\n)?", line, re.IGNORECASE
+        ):
+            parts.append(line)
+            batch = "".join(parts)
+            parts.clear()
+            yield batch
+            continue
+
         segment_start = 0
         index = 0
         while index < len(line):
@@ -760,6 +788,8 @@ def decode_sql_identifier(source: str, token: SqlToken) -> str:
     token_text = sql_token_text(source, token)
     if token.kind == "quoted_identifier":
         return token_text[1:-1].replace('""', '"')
+    if token.kind == "bracket_identifier":
+        return token_text[1:-1].replace("]]", "]")
     return token_text
 
 
@@ -856,7 +886,8 @@ def parse_insert_columns(
         identifiers = [
             tokens[token_index]
             for token_index in indexes
-            if tokens[token_index].kind in {"word", "quoted_identifier"}
+            if tokens[token_index].kind
+            in {"word", "quoted_identifier", "bracket_identifier"}
         ]
         if len(identifiers) != 1:
             raise TokenizerError(
@@ -915,6 +946,8 @@ def insert_expression_groups(
                 token.kind != "symbol"
                 or sql_token_text(source, token) != "("
             ):
+                if groups:
+                    break
                 raise TokenizerError(
                     f"Unsupported INSERT VALUES syntax"
                     f"{sql_location(source, token.start, path)}"
