@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Irreversibly depersonalize sensitive values in JSON and XML files."""
+"""Irreversibly depersonalize sensitive values in JSON, XML, and SQL files."""
 
 from __future__ import annotations
 
@@ -41,6 +41,8 @@ DEFAULT_ACCOUNT_KEYS = (
     "beneficiaryAccount",
     "payerAccount",
     "recipientAccount",
+    "clientNum",
+    "esflId",
 )
 DEFAULT_PASSPORT_SERIES_KEYS = ("passport_series", "passportSeries")
 DEFAULT_PASSPORT_NUMBER_KEYS = ("passport_number", "passportNumber")
@@ -82,7 +84,7 @@ PRIVATE_IPV4_NETWORKS = tuple(
 
 
 class TokenizerError(RuntimeError):
-    """Raised when tokenization or restoration cannot be completed safely."""
+    """Raised when depersonalization cannot be completed safely."""
 
 
 @dataclass
@@ -91,13 +93,158 @@ class PreparedFile:
     content: str
 
 
+@dataclass(frozen=True)
+class SqlToken:
+    kind: str
+    start: int
+    end: int
+    text: str
+
+
+SQL_TRIVIA_KINDS = {"whitespace", "line_comment", "block_comment"}
+
+
+def tokenize_postgresql(source: str, path: Path | None = None) -> list[SqlToken]:
+    tokens: list[SqlToken] = []
+    index = 0
+    length = len(source)
+
+    def add(kind: str, start: int, end: int) -> None:
+        tokens.append(SqlToken(kind, start, end, source[start:end]))
+
+    while index < length:
+        start = index
+        character = source[index]
+
+        if character.isspace():
+            index += 1
+            while index < length and source[index].isspace():
+                index += 1
+            add("whitespace", start, index)
+            continue
+
+        if source.startswith("--", index):
+            newline = source.find("\n", index + 2)
+            index = length if newline == -1 else newline
+            add("line_comment", start, index)
+            continue
+
+        if source.startswith("/*", index):
+            depth = 1
+            index += 2
+            while index < length and depth:
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                raise TokenizerError(
+                    f"Unterminated SQL comment{sql_location(source, start, path)}"
+                )
+            add("block_comment", start, index)
+            continue
+
+        if character == "'":
+            escape_string = (
+                start > 0
+                and source[start - 1] in {"e", "E"}
+                and (start == 1 or not source[start - 2].isalnum())
+            )
+            index += 1
+            while index < length:
+                if escape_string and source[index] == "\\":
+                    index += 2
+                    continue
+                if source[index] != "'":
+                    index += 1
+                    continue
+                if index + 1 < length and source[index + 1] == "'":
+                    index += 2
+                    continue
+                index += 1
+                break
+            else:
+                raise TokenizerError(
+                    f"Unterminated SQL string{sql_location(source, start, path)}"
+                )
+            add("string", start, index)
+            continue
+
+        if character == '"':
+            index += 1
+            while index < length:
+                if source[index] != '"':
+                    index += 1
+                    continue
+                if index + 1 < length and source[index + 1] == '"':
+                    index += 2
+                    continue
+                index += 1
+                break
+            else:
+                raise TokenizerError(
+                    f"Unterminated SQL identifier"
+                    f"{sql_location(source, start, path)}"
+                )
+            add("quoted_identifier", start, index)
+            continue
+
+        if character == "$":
+            delimiter_match = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", source[index:])
+            if delimiter_match:
+                delimiter = delimiter_match.group(0)
+                content_start = index + len(delimiter)
+                close = source.find(delimiter, content_start)
+                if close == -1:
+                    raise TokenizerError(
+                        f"Unterminated dollar-quoted SQL string"
+                        f"{sql_location(source, start, path)}"
+                    )
+                index = close + len(delimiter)
+                add("dollar_string", start, index)
+                continue
+
+        if character.isalpha() or character == "_" or ord(character) >= 128:
+            index += 1
+            while index < length and (
+                source[index].isalnum()
+                or source[index] in {"_", "$"}
+                or ord(source[index]) >= 128
+            ):
+                index += 1
+            add("word", start, index)
+            continue
+
+        if character.isdigit():
+            index += 1
+            while index < length and (source[index].isdigit() or source[index] == "."):
+                index += 1
+            add("number", start, index)
+            continue
+
+        index += 1
+        add("symbol", start, index)
+
+    return tokens
+
+
+def sql_location(source: str, offset: int, path: Path | None) -> str:
+    line = source.count("\n", 0, offset) + 1
+    prefix = f" in {path}" if path else ""
+    return f"{prefix} at line {line}"
+
+
 def normalize_phone(value: Any) -> str | None:
     """Return a canonical Russian phone number or None for non-phone values."""
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
 
     digits = re.sub(r"\D", "", str(value))
-    if len(digits) == 10 and digits.startswith("9"):
+    if len(digits) == 10:
         digits = "7" + digits
     elif len(digits) == 11 and digits.startswith("8"):
         digits = "7" + digits[1:]
@@ -130,11 +277,11 @@ def normalize_sensitive_value(kind: str, value: Any) -> str | None:
         }
         return normalized if re.fullmatch(patterns[kind], normalized) else None
     normalized = re.sub(r"\s", "", str(value)).casefold()
+    if kind == "account":
+        return normalized or None
     if kind == "inn" and not re.fullmatch(r"\d{10}|\d{12}", normalized):
         return None
     if kind == "kpp" and not re.fullmatch(r"[0-9a-zа-я]{9}", normalized):
-        return None
-    if kind == "account" and not re.fullmatch(r"\d{20}", normalized):
         return None
     return normalized
 
@@ -153,10 +300,7 @@ def get_or_create_token(
     registry_key = f"{kind}:{canonical}"
     token = tokens_by_value.get(registry_key)
     if token is None:
-        if kind in REPEATED_DIGIT_KINDS:
-            token = secrets.choice(string.digits)
-        else:
-            token = new_token(kind, set(tokens_by_value.values()))
+        token = new_token(kind, set(tokens_by_value.values()))
         tokens_by_value[registry_key] = token
     return token
 
@@ -167,9 +311,13 @@ def mask_structured_value(
     canonical = normalize_sensitive_value(kind, value)
     if canonical is None:
         return None
-    token = get_or_create_token(kind, canonical, tokens_by_value)
     if kind in REPEATED_DIGIT_KINDS:
-        return token * len(str(value))
+        raw_value = str(value)
+        first_symbol = next(
+            (symbol for symbol in raw_value if symbol.isalnum()), None
+        )
+        return first_symbol * len(raw_value) if first_symbol else None
+    token = get_or_create_token(kind, canonical, tokens_by_value)
     return token
 
 
@@ -438,6 +586,327 @@ def transform_xml_document(
     return replacements
 
 
+def next_sql_token(tokens: list[SqlToken], index: int) -> int | None:
+    while index < len(tokens):
+        if tokens[index].kind not in SQL_TRIVIA_KINDS:
+            return index
+        index += 1
+    return None
+
+
+def sql_word(token: SqlToken, value: str) -> bool:
+    return token.kind == "word" and token.text.casefold() == value.casefold()
+
+
+def matching_sql_parenthesis(tokens: list[SqlToken], opening: int) -> int:
+    depth = 0
+    for index in range(opening, len(tokens)):
+        token = tokens[index]
+        if token.kind != "symbol":
+            continue
+        if token.text == "(":
+            depth += 1
+        elif token.text == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise TokenizerError("Unbalanced parentheses in SQL INSERT")
+
+
+def split_sql_expressions(
+    tokens: list[SqlToken], start: int, end: int
+) -> list[tuple[int, int]]:
+    expressions: list[tuple[int, int]] = []
+    expression_start = start
+    depth = 0
+    for index in range(start, end):
+        token = tokens[index]
+        if token.kind != "symbol":
+            continue
+        if token.text == "(":
+            depth += 1
+        elif token.text == ")":
+            depth -= 1
+        elif token.text == "," and depth == 0:
+            expressions.append((expression_start, index))
+            expression_start = index + 1
+    expressions.append((expression_start, end))
+    return expressions
+
+
+def decode_sql_identifier(token: SqlToken) -> str:
+    if token.kind == "quoted_identifier":
+        return token.text[1:-1].replace('""', '"')
+    return token.text
+
+
+def decode_sql_literal(token: SqlToken) -> str:
+    if token.kind == "string":
+        return token.text[1:-1].replace("''", "'")
+    if token.kind == "dollar_string":
+        delimiter_match = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", token.text)
+        if not delimiter_match:
+            return token.text
+        delimiter = delimiter_match.group(0)
+        return token.text[len(delimiter) : -len(delimiter)]
+    return token.text
+
+
+def encode_sql_literal(token: SqlToken, value: str) -> str:
+    if token.kind == "string":
+        return "'" + value.replace("'", "''") + "'"
+    if token.kind == "dollar_string":
+        delimiter_match = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", token.text)
+        delimiter = delimiter_match.group(0) if delimiter_match else "$$"
+        return delimiter + value + delimiter
+    return "'" + value.replace("'", "''") + "'"
+
+
+def significant_sql_tokens(
+    tokens: list[SqlToken], start: int, end: int
+) -> list[int]:
+    return [
+        index
+        for index in range(start, end)
+        if tokens[index].kind not in SQL_TRIVIA_KINDS
+    ]
+
+
+def sql_statement_end(tokens: list[SqlToken], start: int) -> int:
+    depth = 0
+    for index in range(start, len(tokens)):
+        token = tokens[index]
+        if token.kind != "symbol":
+            continue
+        if token.text == "(":
+            depth += 1
+        elif token.text == ")":
+            depth = max(depth - 1, 0)
+        elif token.text == ";" and depth == 0:
+            return index
+    return len(tokens)
+
+
+def parse_insert_columns(
+    source: str,
+    path: Path,
+    tokens: list[SqlToken],
+    insert_index: int,
+) -> tuple[list[str], int, int]:
+    into_index = next_sql_token(tokens, insert_index + 1)
+    if into_index is None or not sql_word(tokens[into_index], "into"):
+        raise TokenizerError(
+            f"Unsupported INSERT syntax"
+            f"{sql_location(source, tokens[insert_index].start, path)}"
+        )
+
+    statement_end = sql_statement_end(tokens, insert_index)
+    index = next_sql_token(tokens, into_index + 1)
+    opening = None
+    while index is not None and index < statement_end:
+        token = tokens[index]
+        if token.kind == "symbol" and token.text == "(":
+            opening = index
+            break
+        if sql_word(token, "values") or sql_word(token, "select"):
+            break
+        index = next_sql_token(tokens, index + 1)
+
+    if opening is None:
+        raise TokenizerError(
+            f"INSERT without an explicit target column list"
+            f"{sql_location(source, tokens[insert_index].start, path)}"
+        )
+
+    closing = matching_sql_parenthesis(tokens, opening)
+    column_ranges = split_sql_expressions(tokens, opening + 1, closing)
+    columns: list[str] = []
+    for start, end in column_ranges:
+        indexes = significant_sql_tokens(tokens, start, end)
+        identifiers = [
+            tokens[token_index]
+            for token_index in indexes
+            if tokens[token_index].kind in {"word", "quoted_identifier"}
+        ]
+        if len(identifiers) != 1:
+            raise TokenizerError(
+                f"Unsupported target column syntax"
+                f"{sql_location(source, tokens[start].start, path)}"
+            )
+        columns.append(decode_sql_identifier(identifiers[0]).casefold())
+
+    source_index = next_sql_token(tokens, closing + 1)
+    depth = 0
+    while source_index is not None and source_index < statement_end:
+        token = tokens[source_index]
+        if token.kind == "symbol":
+            if token.text == "(":
+                depth += 1
+            elif token.text == ")":
+                depth = max(depth - 1, 0)
+        elif depth == 0 and (
+            sql_word(token, "values") or sql_word(token, "select")
+        ):
+            break
+        source_index = next_sql_token(tokens, source_index + 1)
+    if source_index is None or source_index >= statement_end:
+        raise TokenizerError(
+            f"INSERT source must use VALUES or SELECT"
+            f"{sql_location(source, tokens[insert_index].start, path)}"
+        )
+    return columns, source_index, statement_end
+
+
+def insert_expression_groups(
+    source: str,
+    path: Path,
+    tokens: list[SqlToken],
+    source_index: int,
+    statement_end: int,
+    column_count: int,
+) -> list[list[tuple[int, int]]]:
+    if sql_word(tokens[source_index], "values"):
+        groups: list[list[tuple[int, int]]] = []
+        index = next_sql_token(tokens, source_index + 1)
+        while index is not None and index < statement_end:
+            token = tokens[index]
+            if sql_word(token, "on") or sql_word(token, "returning"):
+                break
+            if token.kind == "symbol" and token.text == ",":
+                index = next_sql_token(tokens, index + 1)
+                continue
+            if token.kind != "symbol" or token.text != "(":
+                raise TokenizerError(
+                    f"Unsupported INSERT VALUES syntax"
+                    f"{sql_location(source, token.start, path)}"
+                )
+            closing = matching_sql_parenthesis(tokens, index)
+            expressions = split_sql_expressions(tokens, index + 1, closing)
+            if len(expressions) != column_count:
+                raise TokenizerError(
+                    f"INSERT has {column_count} target columns but "
+                    f"{len(expressions)} VALUES expressions"
+                    f"{sql_location(source, token.start, path)}"
+                )
+            groups.append(expressions)
+            index = next_sql_token(tokens, closing + 1)
+        return groups
+
+    start = next_sql_token(tokens, source_index + 1)
+    if start is None:
+        return []
+    if sql_word(tokens[start], "distinct") or sql_word(tokens[start], "all"):
+        start = next_sql_token(tokens, start + 1)
+        if start is None:
+            return []
+
+    depth = 0
+    end = statement_end
+    for index in range(start, statement_end):
+        token = tokens[index]
+        if token.kind == "symbol":
+            if token.text == "(":
+                depth += 1
+            elif token.text == ")":
+                depth -= 1
+        elif depth == 0 and (
+            sql_word(token, "from")
+            or sql_word(token, "union")
+            or sql_word(token, "intersect")
+            or sql_word(token, "except")
+            or sql_word(token, "returning")
+        ):
+            end = index
+            break
+    expressions = split_sql_expressions(tokens, start, end)
+    if len(expressions) != column_count:
+        has_literal = any(
+            tokens[index].kind in {"string", "dollar_string", "number"}
+            for expression_start, expression_end in expressions
+            for index in range(expression_start, expression_end)
+        )
+        if has_literal:
+            raise TokenizerError(
+                f"Cannot map {len(expressions)} SELECT expressions to "
+                f"{column_count} target columns"
+                f"{sql_location(source, tokens[source_index].start, path)}"
+            )
+        return []
+    return [expressions]
+
+
+def transform_sql_document(
+    source: str,
+    path: Path,
+    field_types: dict[str, str],
+    tokens_by_value: dict[str, str],
+) -> tuple[str, int]:
+    tokens = tokenize_postgresql(source, path)
+    replacements: dict[int, tuple[int, str]] = {}
+    replacement_count = 0
+
+    for insert_index, token in enumerate(tokens):
+        if not sql_word(token, "insert"):
+            continue
+        into_index = next_sql_token(tokens, insert_index + 1)
+        if into_index is None or not sql_word(tokens[into_index], "into"):
+            continue
+        columns, source_index, statement_end = parse_insert_columns(
+            source, path, tokens, insert_index
+        )
+        groups = insert_expression_groups(
+            source,
+            path,
+            tokens,
+            source_index,
+            statement_end,
+            len(columns),
+        )
+        for expressions in groups:
+            for column, (start, end) in zip(columns, expressions):
+                kind = field_types.get(column)
+                if kind is None:
+                    continue
+                literal_indexes = [
+                    index
+                    for index in range(start, end)
+                    if tokens[index].kind in {"string", "dollar_string", "number"}
+                ]
+                for literal_index in literal_indexes:
+                    literal = tokens[literal_index]
+                    original = decode_sql_literal(literal)
+                    masked = mask_structured_value(
+                        kind, original, tokens_by_value
+                    )
+                    if masked is None:
+                        continue
+                    replacements[literal.start] = (
+                        literal.end,
+                        encode_sql_literal(literal, masked),
+                    )
+                    replacement_count += 1
+
+    for token in tokens:
+        if token.kind not in {"string", "dollar_string"}:
+            continue
+        if token.start in replacements:
+            continue
+        original = decode_sql_literal(token)
+        masked, count = mask_embedded_text(original, tokens_by_value)
+        if masked != original:
+            replacements[token.start] = (
+                token.end,
+                encode_sql_literal(token, masked),
+            )
+            replacement_count += count
+
+    result = source
+    for start in sorted(replacements, reverse=True):
+        end, replacement = replacements[start]
+        result = result[:start] + replacement + result[end:]
+    return result, replacement_count
+
+
 def iter_data_files(root: Path) -> Iterable[Path]:
     ignored_directories = {".git", ".idea"}
     for current_directory, directory_names, file_names in os.walk(root):
@@ -448,7 +917,7 @@ def iter_data_files(root: Path) -> Iterable[Path]:
         for file_name in sorted(file_names):
             path = current_path / file_name
             if (
-                path.suffix.casefold() in {".json", ".xml"}
+                path.suffix.casefold() in {".json", ".xml", ".sql"}
                 and path.is_file()
                 and not path.is_symlink()
             ):
@@ -480,7 +949,7 @@ def prepare_masking(
                     tokens_by_value=tokens_by_value,
                 )
                 serialized = serialize_json(document, source)
-            else:
+            elif path.suffix.casefold() == ".xml":
                 document = parse_xml_document(source, path)
                 count = transform_xml_document(
                     document=document,
@@ -488,6 +957,10 @@ def prepare_masking(
                     tokens_by_value=tokens_by_value,
                 )
                 serialized = serialize_xml(document, source)
+            else:
+                serialized, count = transform_sql_document(
+                    source, path, field_types, tokens_by_value
+                )
             if count:
                 prepared.append(PreparedFile(path, serialized))
                 replacement_count += count
@@ -524,7 +997,7 @@ def existing_directory(value: str) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Irreversibly depersonalize sensitive JSON/XML values"
+        description="Irreversibly depersonalize sensitive JSON/XML/SQL values"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -535,7 +1008,7 @@ def build_parser() -> argparse.ArgumentParser:
     mask.add_argument(
         "--phone-keys",
         default=",".join(DEFAULT_PHONE_KEYS),
-        help="Comma-separated JSON/XML field names",
+        help="Comma-separated JSON/XML/SQL field names",
     )
     mask.add_argument(
         "--inn-keys",
