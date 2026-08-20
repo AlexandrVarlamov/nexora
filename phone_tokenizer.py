@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -20,6 +21,7 @@ from typing import Any, Iterable
 
 TOKEN_ALPHABET = string.ascii_uppercase
 TOKEN_LENGTH = 20
+LOGGER = logging.getLogger(__name__)
 REPEATED_DIGIT_KINDS = {
     "phone",
     "inn",
@@ -1159,6 +1161,16 @@ def iter_data_files(root: Path) -> Iterable[Path]:
                 yield path
 
 
+def failed_sql_line(statement: str, error: Exception) -> tuple[int, str]:
+    """Return the statement-relative line and source text for an SQL error."""
+    location = re.search(r"\bat line (\d+)\b", str(error))
+    line_number = int(location.group(1)) if location else 1
+    lines = statement.splitlines()
+    if line_number <= len(lines):
+        return line_number, lines[line_number - 1].rstrip()
+    return line_number, "<SQL line unavailable>"
+
+
 def prepare_sql_file(
     path: Path,
     field_types: dict[str, str],
@@ -1174,12 +1186,26 @@ def prepare_sql_file(
             with os.fdopen(
                 descriptor, "w", encoding="utf-8", newline=""
             ) as output_stream:
+                statement_start_line = 1
                 for statement in iter_postgresql_statements(source_stream):
-                    masked, count = transform_sql_document(
-                        statement, path, field_types, tokens_by_value
-                    )
+                    try:
+                        masked, count = transform_sql_document(
+                            statement, path, field_types, tokens_by_value
+                        )
+                    except Exception as error:
+                        failed_line_number, failed_line = failed_sql_line(
+                            statement, error
+                        )
+                        LOGGER.exception(
+                            "Unable to process SQL in %s at line %d: %s",
+                            path,
+                            statement_start_line + failed_line_number - 1,
+                            failed_line,
+                        )
+                        raise
                     output_stream.write(masked)
                     replacement_count += count
+                    statement_start_line += statement.count("\n")
                 output_stream.flush()
                 os.fsync(output_stream.fileno())
         if replacement_count == 0:
