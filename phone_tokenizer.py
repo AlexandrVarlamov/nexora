@@ -32,10 +32,28 @@ REPEATED_DIGIT_KINDS = {
     "ogrn",
     "card_number",
 }
-DEFAULT_PHONE_KEYS = ("phone", "phoneNumber", "mobilePhone", "msisdn")
+DEFAULT_PHONE_KEYS = (
+    "phone",
+    "phoneNumber",
+    "mobilePhone",
+    "msisdn",
+    "PhoneNumber",
+)
 DEFAULT_INN_KEYS = ("inn", "tax_id")
 DEFAULT_KPP_KEYS = ("kpp",)
-DEFAULT_FIO_KEYS = ("last_name", "first_name", "middle_name", "full_name", "fio")
+DEFAULT_FIO_KEYS = (
+    "last_name",
+    "first_name",
+    "middle_name",
+    "full_name",
+    "fio",
+    "lastName",
+    "firstName",
+    "middleName",
+    "patronymic",
+    "name",
+    "surname",
+)
 DEFAULT_ACCOUNT_KEYS = (
     "account",
     "accountNumber",
@@ -43,11 +61,37 @@ DEFAULT_ACCOUNT_KEYS = (
     "beneficiaryAccount",
     "payerAccount",
     "recipientAccount",
+    "applicationNum",
     "clientNum",
+    "applicationNumber",
+    "appNum",
+    "appNums",
+    "appId",
     "esflId",
+    "appSequence",
+    "businessKey",
+    "accNumber",
+    "cardAppSequence",
+    "appIkarNumber",
+    "cardNumberOut",
+    "snils",
+    "number",
+    "guid",
+    "applicationSeq",
 )
-DEFAULT_PASSPORT_SERIES_KEYS = ("passport_series", "passportSeries")
-DEFAULT_PASSPORT_NUMBER_KEYS = ("passport_number", "passportNumber")
+DEFAULT_PASSPORT_SERIES_KEYS = (
+    "passport_series",
+    "passportSeries",
+    "passportSeria",
+    "series",
+    "docSeries",
+)
+DEFAULT_PASSPORT_NUMBER_KEYS = (
+    "passport_number",
+    "passportNumber",
+    "passportId",
+    "docNum",
+)
 DEFAULT_OGRN_KEYS = ("ogrn", "ogrn_number", "ogrnNumber")
 DEFAULT_CARD_NUMBER_KEYS = ("cardNumber", "card_number")
 TOKEN_PREFIXES = {
