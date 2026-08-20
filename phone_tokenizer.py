@@ -33,6 +33,11 @@ REPEATED_DIGIT_KINDS = {
     "card_number",
     "organization",
     "address",
+    "orgCode",
+    "orgName",
+    "okfs",
+    "opfCode",
+    "org",
 }
 DEFAULT_PHONE_KEYS = (
     "phone",
@@ -40,10 +45,13 @@ DEFAULT_PHONE_KEYS = (
     "mobilePhone",
     "msisdn",
     "PhoneNumber",
+    "cellPhone",
+    "mainPhone",
 )
 DEFAULT_INN_KEYS = ("inn", "tax_id")
 DEFAULT_KPP_KEYS = ("kpp",)
 DEFAULT_FIO_KEYS = (
+    "signerFio",
     "last_name",
     "first_name",
     "middle_name",
@@ -55,9 +63,17 @@ DEFAULT_FIO_KEYS = (
     "patronymic",
     "name",
     "surname",
+    "employeeName",
+    "changeEmployeeName",
+    "shortName",
+    "fullName",
+    "shortName",
+    "chiefName",
+    "chiefPosition",
 )
 DEFAULT_ACCOUNT_KEYS = (
     "account",
+    "accountNum",
     "accountNumber",
     "account_number",
     "beneficiaryAccount",
@@ -93,6 +109,11 @@ DEFAULT_PASSPORT_NUMBER_KEYS = (
     "passportNumber",
     "passportId",
     "docNum",
+    "birthday",
+    "birth_day",
+    "birthDay",
+    "birth",
+    "departCode",
 )
 DEFAULT_OGRN_KEYS = ("ogrn", "ogrn_number", "ogrnNumber")
 DEFAULT_CARD_NUMBER_KEYS = ("cardNumber", "card_number")
@@ -107,9 +128,16 @@ DEFAULT_ORGANIZATION_KEYS = (
     "employer_name",
     "legalName",
     "legal_name",
+    "issuedBy",
+    "userFullName",
+    "fiveNtContractNumber",
+    "employee_name",
+    "contractNum",
 )
 DEFAULT_ADDRESS_KEYS = (
     "address",
+    "rawSource",
+    "cityArea",
     "registrationAddress",
     "registration_address",
     "legalAddress",
@@ -120,6 +148,33 @@ DEFAULT_ADDRESS_KEYS = (
     "postal_address",
     "residentialAddress",
     "residential_address",
+    "birth_place",
+    "region",
+    "streetName",
+    "home",
+    "building",
+    "regionCode",
+    "regionName",
+    "postIndex",
+    "regionType",
+    "district",
+    "streetType",
+    "street",
+    "house",
+    "flat",
+    "kladr",
+    "orgName",
+    "city",
+    "country",
+    "streat",
+    "birthPlace",
+    "legalAddress",
+    "district",
+    "countryName",
+    "changeEmloyeeLogin",
+    "employeeLogin",
+    "fioAR",
+    "issuedBy",
 )
 TOKEN_PREFIXES = {
     "phone": "PHONE_",
