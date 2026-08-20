@@ -31,6 +31,8 @@ REPEATED_DIGIT_KINDS = {
     "passport_number",
     "ogrn",
     "card_number",
+    "organization",
+    "address",
 }
 DEFAULT_PHONE_KEYS = (
     "phone",
@@ -94,6 +96,31 @@ DEFAULT_PASSPORT_NUMBER_KEYS = (
 )
 DEFAULT_OGRN_KEYS = ("ogrn", "ogrn_number", "ogrnNumber")
 DEFAULT_CARD_NUMBER_KEYS = ("cardNumber", "card_number")
+DEFAULT_ORGANIZATION_KEYS = (
+    "organization",
+    "organizationName",
+    "organisationName",
+    "company",
+    "companyName",
+    "employer",
+    "employerName",
+    "employer_name",
+    "legalName",
+    "legal_name",
+)
+DEFAULT_ADDRESS_KEYS = (
+    "address",
+    "registrationAddress",
+    "registration_address",
+    "legalAddress",
+    "legal_address",
+    "actualAddress",
+    "actual_address",
+    "postalAddress",
+    "postal_address",
+    "residentialAddress",
+    "residential_address",
+)
 TOKEN_PREFIXES = {
     "phone": "PHONE_",
     "inn": "INN_",
@@ -108,6 +135,8 @@ TOKEN_PREFIXES = {
     "passport_number": "PASSPORT_NUMBER_",
     "ogrn": "OGRN_",
     "card_number": "CARD_",
+    "organization": "ORGANIZATION_",
+    "address": "ADDRESS_",
 }
 EMAIL_PATTERN = re.compile(
     r"(?<![\w.+-])"
@@ -582,6 +611,11 @@ def transform_document(
                 replace_value(item, pointer + [index], kind)
                 for index, item in enumerate(value)
             ]
+        if isinstance(value, dict):
+            return {
+                key: replace_value(child, pointer + [key], kind)
+                for key, child in value.items()
+            }
 
         masked = mask_structured_value(kind, value, tokens_by_value)
         if masked is None:
@@ -761,7 +795,7 @@ def transform_xml_document(
 
         for index, child in enumerate(element):
             child_name = xml_local_name(child.tag)
-            child_kind = None
+            child_kind = kind
             if is_passport and child_name == "series":
                 child_kind = "passport_series"
             elif is_passport and child_name == "number":
@@ -1412,6 +1446,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated payment card number field names",
     )
     mask.add_argument(
+        "--organization-keys",
+        default=",".join(DEFAULT_ORGANIZATION_KEYS),
+        help="Comma-separated organization name field names",
+    )
+    mask.add_argument(
+        "--address-keys",
+        default=",".join(DEFAULT_ADDRESS_KEYS),
+        help="Comma-separated address field names",
+    )
+    mask.add_argument(
         "--dry-run", action="store_true", help="Report replacements without writing files"
     )
 
@@ -1432,6 +1476,8 @@ def main(argv: list[str] | None = None) -> int:
             ("passport_number", args.passport_number_keys),
             ("ogrn", args.ogrn_keys),
             ("card_number", args.card_number_keys),
+            ("organization", args.organization_keys),
+            ("address", args.address_keys),
         ):
             for key in raw_keys.split(","):
                 if key.strip():

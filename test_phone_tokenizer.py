@@ -9,6 +9,7 @@ from pathlib import Path
 from phone_tokenizer import (
     TokenizerError,
     iter_postgresql_statements,
+    main,
     normalize_phone,
     prepare_masking,
     write_prepared_files,
@@ -298,6 +299,71 @@ SELECT phone FROM staging_clients;
             self.assertIn("EMAIL_", masked)
             self.assertIn("USER_", masked)
             self.assertIn("SELECT phone FROM staging_clients", masked)
+
+    def test_masks_organization_names_and_addresses_in_all_formats(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "repo"
+            root.mkdir()
+            json_file = root / "client.json"
+            xml_file = root / "client.xml"
+            sql_file = root / "client.sql"
+            organization = "ООО «Альфа Технологии»"
+            address = "Москва, Новослободская улица, 24"
+            json_file.write_text(
+                json.dumps(
+                    {
+                        "employer_name": organization,
+                        "registration_address": {
+                            "city": "Москва",
+                            "street": "Новослободская улица",
+                            "house": 24,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            xml_file.write_text(
+                f"""<client organizationName="{organization}">
+  <postalAddress>
+    <city>Москва</city>
+    <street>Новослободская улица</street>
+  </postalAddress>
+</client>""",
+                encoding="utf-8",
+            )
+            sql_file.write_text(
+                "INSERT INTO clients (companyName, address) VALUES "
+                f"('{organization}', '{address}');\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(main(["mask", str(root)]), 0)
+
+            masked_json = json.loads(json_file.read_text(encoding="utf-8"))
+            masked_xml = ET.fromstring(xml_file.read_text(encoding="utf-8"))
+            masked_sql = sql_file.read_text(encoding="utf-8")
+            self.assertEqual(masked_json["employer_name"], "О" * len(organization))
+            self.assertEqual(
+                masked_json["registration_address"]["city"], "М" * len("Москва")
+            )
+            self.assertEqual(
+                masked_json["registration_address"]["street"],
+                "Н" * len("Новослободская улица"),
+            )
+            self.assertEqual(masked_json["registration_address"]["house"], "22")
+            self.assertEqual(
+                masked_xml.attrib["organizationName"], "О" * len(organization)
+            )
+            self.assertEqual(
+                masked_xml.findtext("postalAddress/city"), "М" * len("Москва")
+            )
+            self.assertEqual(
+                masked_xml.findtext("postalAddress/street"),
+                "Н" * len("Новослободская улица"),
+            )
+            self.assertIn("'О" + "О" * (len(organization) - 1) + "'", masked_sql)
+            self.assertIn("'М" + "М" * (len(address) - 1) + "'", masked_sql)
 
     def test_rejects_sql_insert_without_explicit_columns(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
