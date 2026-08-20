@@ -151,8 +151,9 @@ class PhoneTokenizerTest(unittest.TestCase):
             write_prepared_files(prepared)
             text = json.loads(data_file.read_text(encoding="utf-8"))["text"]
 
-            self.assertIn("BANK_EMAIL_", text)
-            self.assertRegex(text, r"(?<!BANK_)EMAIL_[A-Z]{20}")
+            self.assertNotIn("@", text)
+            self.assertNotIn("worker", text)
+            self.assertNotIn("client", text)
             self.assertIn("USER_", text)
             self.assertEqual(text.count("127.0.0.1"), 3)
             self.assertIn("8.8.8.8", text)
@@ -290,12 +291,11 @@ SELECT phone FROM staging_clients;
             self.assertIn("'444444444444'", masked)
             self.assertIn("'111111111111'", masked)
             self.assertRegex(masked, r"'FIO_[A-Z]{20}'")
-            self.assertIn("BANK_EMAIL_", masked)
+            self.assertNotIn("@", masked)
             self.assertIn("127.0.0.1", masked)
             self.assertIn("'2222222222'", masked)
             self.assertIn("'4444444444444444444'", masked)
             self.assertIn("'" + "F" * 32 + "'", masked)
-            self.assertIn("EMAIL_", masked)
             self.assertIn("USER_", masked)
             self.assertIn("SELECT phone FROM staging_clients", masked)
 

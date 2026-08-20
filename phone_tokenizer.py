@@ -602,11 +602,8 @@ def mask_embedded_text(
 
     def replace_email(match: re.Match[str]) -> str:
         nonlocal match_count
-        email = match.group(0)
-        domain = email.rsplit("@", 1)[1].casefold()
-        kind = "bank_email" if domain == "int.gazprombank.ru" else "email"
         match_count += 1
-        return get_or_create_token(kind, email.casefold(), tokens_by_value)
+        return ""
 
     def replace_ip(match: re.Match[str]) -> str:
         nonlocal match_count
