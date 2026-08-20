@@ -932,7 +932,7 @@ def parse_insert_columns(
     path: Path,
     tokens: list[SqlToken],
     insert_index: int,
-) -> tuple[list[str], int, int]:
+) -> tuple[list[str], int, int] | None:
     into_index = next_sql_token(tokens, insert_index + 1)
     if into_index is None or not sql_word(source, tokens[into_index], "into"):
         raise TokenizerError(
@@ -950,6 +950,12 @@ def parse_insert_columns(
             break
         if sql_word(source, token, "values") or sql_word(source, token, "select"):
             break
+        if sql_word(source, token, "default"):
+            values_index = next_sql_token(tokens, index + 1)
+            if values_index is not None and sql_word(
+                source, tokens[values_index], "values"
+            ):
+                return None
         index = next_sql_token(tokens, index + 1)
 
     if opening is None:
@@ -1159,9 +1165,12 @@ def transform_sql_document(
             source, tokens[into_index], "into"
         ):
             continue
-        columns, source_index, statement_end = parse_insert_columns(
+        insert_columns = parse_insert_columns(
             source, path, tokens, insert_index
         )
+        if insert_columns is None:
+            continue
+        columns, source_index, statement_end = insert_columns
         groups = insert_expression_groups(
             source,
             path,

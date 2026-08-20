@@ -385,6 +385,27 @@ SELECT phone FROM staging_clients;
             self.assertEqual(sql_file.read_text(encoding="utf-8"), original)
             self.assertEqual(list(root.glob(".*.tmp")), [])
 
+    def test_skips_sql_insert_default_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "repo"
+            root.mkdir()
+            sql_file = root / "defaults.sql"
+            original = (
+                "INSERT INTO pGPB_AccNumber DEFAULT VALUES;\n"
+                "INSERT INTO clients (phone) VALUES ('89992102974');\n"
+            )
+            sql_file.write_text(original, encoding="utf-8")
+
+            prepared, count = prepare_masking(
+                [root], field_types={"phone": "phone"}
+            )
+
+            self.assertEqual(count, 1)
+            write_prepared_files(prepared)
+            masked = sql_file.read_text(encoding="utf-8")
+            self.assertIn("INSERT INTO pGPB_AccNumber DEFAULT VALUES;", masked)
+            self.assertIn("'88888888888'", masked)
+
     def test_streams_sql_statements_without_splitting_quoted_semicolons(
         self,
     ) -> None:
