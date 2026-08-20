@@ -7,7 +7,6 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from phone_tokenizer import (
-    TokenizerError,
     iter_postgresql_statements,
     main,
     normalize_phone,
@@ -365,21 +364,26 @@ SELECT phone FROM staging_clients;
             self.assertIn("'О" + "О" * (len(organization) - 1) + "'", masked_sql)
             self.assertIn("'М" + "М" * (len(address) - 1) + "'", masked_sql)
 
-    def test_rejects_sql_insert_without_explicit_columns(self) -> None:
+    def test_skips_sql_insert_without_explicit_columns_with_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "repo"
             root.mkdir()
             sql_file = root / "invalid.sql"
-            original = "INSERT INTO clients VALUES ('89992102974');\n"
+            original = (
+                "-- A preceding comment verifies the global line number.\n"
+                "INSERT INTO clients VALUES ('89992102974');\n"
+            )
             sql_file.write_text(original, encoding="utf-8")
 
-            with self.assertLogs("phone_tokenizer", level="ERROR") as logs:
-                with self.assertRaisesRegex(
-                    TokenizerError, "without an explicit target column list"
-                ):
-                    prepare_masking([root], field_types={"phone": "phone"})
+            with self.assertLogs("phone_tokenizer", level="WARNING") as logs:
+                prepared, count = prepare_masking(
+                    [root], field_types={"phone": "phone"}
+                )
+            self.assertEqual(count, 0)
+            self.assertEqual(prepared, [])
             self.assertIn(
-                f"Unable to process SQL in {sql_file} at line 1: {original.rstrip()}",
+                f"Skipping SQL INSERT without an explicit target column list "
+                f"in {sql_file} at line 2",
                 logs.output[0],
             )
             self.assertEqual(sql_file.read_text(encoding="utf-8"), original)

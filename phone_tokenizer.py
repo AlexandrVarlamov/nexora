@@ -16,7 +16,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 
 TOKEN_ALPHABET = string.ascii_uppercase
@@ -932,7 +932,7 @@ def parse_insert_columns(
     path: Path,
     tokens: list[SqlToken],
     insert_index: int,
-) -> tuple[list[str], int, int] | None:
+) -> tuple[list[str], int, int] | Literal["default_values", "missing_columns"]:
     into_index = next_sql_token(tokens, insert_index + 1)
     if into_index is None or not sql_word(source, tokens[into_index], "into"):
         raise TokenizerError(
@@ -955,14 +955,11 @@ def parse_insert_columns(
             if values_index is not None and sql_word(
                 source, tokens[values_index], "values"
             ):
-                return None
+                return "default_values"
         index = next_sql_token(tokens, index + 1)
 
     if opening is None:
-        raise TokenizerError(
-            f"INSERT without an explicit target column list"
-            f"{sql_location(source, tokens[insert_index].start, path)}"
-        )
+        return "missing_columns"
 
     closing = matching_sql_parenthesis(source, tokens, opening)
     column_ranges = split_sql_expressions(source, tokens, opening + 1, closing)
@@ -1152,6 +1149,7 @@ def transform_sql_document(
     path: Path,
     field_types: dict[str, str],
     tokens_by_value: dict[str, str],
+    statement_start_line: int = 1,
 ) -> tuple[str, int]:
     tokens = tokenize_postgresql(source, path)
     replacements: dict[int, tuple[int, str]] = {}
@@ -1168,7 +1166,18 @@ def transform_sql_document(
         insert_columns = parse_insert_columns(
             source, path, tokens, insert_index
         )
-        if insert_columns is None:
+        if insert_columns == "default_values":
+            continue
+        if insert_columns == "missing_columns":
+            line = statement_start_line + source.count(
+                "\n", 0, token.start
+            )
+            LOGGER.warning(
+                "Skipping SQL INSERT without an explicit target column list "
+                "in %s at line %d",
+                path,
+                line,
+            )
             continue
         columns, source_index, statement_end = insert_columns
         groups = insert_expression_groups(
@@ -1277,7 +1286,11 @@ def prepare_sql_file(
                 for statement in iter_postgresql_statements(source_stream):
                     try:
                         masked, count = transform_sql_document(
-                            statement, path, field_types, tokens_by_value
+                            statement,
+                            path,
+                            field_types,
+                            tokens_by_value,
+                            statement_start_line,
                         )
                     except Exception as error:
                         failed_line_number, failed_line = failed_sql_line(
