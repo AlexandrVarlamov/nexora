@@ -207,19 +207,24 @@ class PhoneTokenizerTest(unittest.TestCase):
             )
             self.assertRegex(masked_xml.findtext("fio"), r"^FIO_[A-Z]{20}$")
 
-    def test_ignores_git_and_idea_directories(self) -> None:
+    def test_ignores_metadata_and_unimock_dictionary_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "repo"
             root.mkdir()
             (root / ".git").mkdir()
             (root / ".idea").mkdir()
+            (root / "unimock-dictionaries").mkdir()
             visible_file = root / "data.json"
             git_file = root / ".git" / "data.json"
             idea_file = root / ".idea" / "data.xml"
+            dictionary_file = root / "unimock-dictionaries" / "data.json"
             visible_file.write_text('{"phone": "89992102974"}', encoding="utf-8")
             git_file.write_text('{"phone": "89992102974"}', encoding="utf-8")
             idea_file.write_text(
                 "<root><phone>89992102974</phone></root>", encoding="utf-8"
+            )
+            dictionary_file.write_text(
+                '{"phone": "89992102974"}', encoding="utf-8"
             )
 
             prepared, count = prepare_masking(
@@ -236,6 +241,10 @@ class PhoneTokenizerTest(unittest.TestCase):
             self.assertEqual(
                 idea_file.read_text(encoding="utf-8"),
                 "<root><phone>89992102974</phone></root>",
+            )
+            self.assertEqual(
+                dictionary_file.read_text(encoding="utf-8"),
+                '{"phone": "89992102974"}',
             )
 
     def test_masks_postgresql_insert_values_and_select(self) -> None:

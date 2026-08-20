@@ -1293,7 +1293,7 @@ def transform_sql_document(
 
 
 def iter_data_files(root: Path) -> Iterable[Path]:
-    ignored_directories = {".git", ".idea"}
+    ignored_directories = {".git", ".idea", "unimock-dictionaries"}
     for current_directory, directory_names, file_names in os.walk(root):
         directory_names[:] = sorted(
             name for name in directory_names if name not in ignored_directories
