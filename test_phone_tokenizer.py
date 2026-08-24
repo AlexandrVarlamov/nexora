@@ -97,7 +97,9 @@ class PhoneTokenizerTest(unittest.TestCase):
                 self.assertEqual(
                     masked[key], first_symbol * len(raw_value)
                 )
-            self.assertRegex(masked["fio"], r"^FIO_[A-Z]{20}$")
+            self.assertEqual(
+                masked["fio"], "В" * len("Варламов Александр Сергеевич")
+            )
 
     def test_same_value_uses_same_digit_across_repositories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -205,7 +207,10 @@ class PhoneTokenizerTest(unittest.TestCase):
             assert_repeated_digit(
                 self, masked_xml.find("payment").attrib["cardNumber"], 19
             )
-            self.assertRegex(masked_xml.findtext("fio"), r"^FIO_[A-Z]{20}$")
+            self.assertEqual(
+                masked_xml.findtext("fio"),
+                "В" * len("Варламов Александр Сергеевич"),
+            )
 
     def test_ignores_metadata_and_unimock_dictionary_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -299,7 +304,7 @@ SELECT phone FROM staging_clients;
             self.assertIn("-- comments remain unchanged", masked)
             self.assertIn("'444444444444'", masked)
             self.assertIn("'111111111111'", masked)
-            self.assertRegex(masked, r"'FIO_[A-Z]{20}'")
+            self.assertIn("'И" + "И" * (len("Иванов Иван Иванович") - 1) + "'", masked)
             self.assertNotIn("@", masked)
             self.assertIn("127.0.0.1", masked)
             self.assertIn("'2222222222'", masked)

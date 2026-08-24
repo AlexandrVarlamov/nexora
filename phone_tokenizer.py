@@ -33,6 +33,7 @@ REPEATED_DIGIT_KINDS = {
     "card_number",
     "organization",
     "address",
+    "fio",
     "orgCode",
     "orgName",
     "okfs",
