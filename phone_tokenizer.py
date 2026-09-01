@@ -154,6 +154,8 @@ DEFAULT_ORGANIZATION_KEYS = (
     "DealerCenterName",
     "office_short_name",
     "court_name",
+    "FullCompanyName",
+    "Court",
 )
 DEFAULT_ADDRESS_KEYS = (
     "address",
@@ -211,6 +213,7 @@ DEFAULT_ADDRESS_KEYS = (
     "signing_address",
     "federal_district",
     "signing_place",
+    "Locality",
 )
 TOKEN_PREFIXES = {
     "phone": "PHONE_",
