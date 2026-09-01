@@ -97,6 +97,8 @@ DEFAULT_ACCOUNT_KEYS = (
     "number",
     "guid",
     "applicationSeq",
+    "Key",
+    "corr_acc",
 )
 DEFAULT_PASSPORT_SERIES_KEYS = (
     "passport_series",
@@ -135,6 +137,7 @@ DEFAULT_ORGANIZATION_KEYS = (
     "fiveNtContractNumber",
     "employee_name",
     "contractNum",
+    "branch_short_name",
 )
 DEFAULT_ADDRESS_KEYS = (
     "address",
@@ -177,6 +180,15 @@ DEFAULT_ADDRESS_KEYS = (
     "employeeLogin",
     "fioAR",
     "issuedBy",
+    "adr",
+    "Nnp",
+    "Ind",
+    "Rgn",
+    "RegN",
+    "branch_address",
+    "street_with_type",
+    "city_district",
+    "fiascode",
 )
 TOKEN_PREFIXES = {
     "phone": "PHONE_",
