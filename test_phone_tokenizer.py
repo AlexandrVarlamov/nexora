@@ -1,10 +1,12 @@
 import io
 import json
+import os
 import re
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest.mock import patch
 
 from phone_tokenizer import (
     iter_postgresql_statements,
@@ -269,6 +271,34 @@ class PhoneTokenizerTest(unittest.TestCase):
                 "88888888888",
             )
             self.assertEqual(sibling.read_text(encoding="utf-8"), original)
+
+    def test_overwrites_a_read_only_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "repo"
+            root.mkdir()
+            target = root / "client.json"
+            target.write_text('{"phone": "89992102974"}', encoding="utf-8")
+            target.chmod(0o444)
+            original_replace = os.replace
+            attempts = {"count": 0}
+
+            def deny_first_replace(source: object, destination: object) -> None:
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise PermissionError(5, "Access is denied")
+                original_replace(source, destination)
+
+            try:
+                with patch("phone_tokenizer.os.replace", deny_first_replace):
+                    self.assertEqual(main(["mask", str(target)]), 0)
+            finally:
+                target.chmod(0o644)
+
+            self.assertGreaterEqual(attempts["count"], 2)
+            self.assertEqual(
+                json.loads(target.read_text(encoding="utf-8"))["phone"],
+                "88888888888",
+            )
 
     def test_masks_postgresql_insert_values_and_select(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

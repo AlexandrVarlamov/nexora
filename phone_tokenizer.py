@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import secrets
+import shutil
+import stat
 import string
 import sys
 import tempfile
@@ -101,6 +103,9 @@ DEFAULT_ACCOUNT_KEYS = (
     "applicationSeq",
     "Key",
     "corr_acc",
+    "directorate_cardoffice_id",
+    "instance_5nt_database_link",
+    "OfficeCode",
 )
 DEFAULT_PASSPORT_SERIES_KEYS = (
     "passport_series",
@@ -140,6 +145,7 @@ DEFAULT_ORGANIZATION_KEYS = (
     "employee_name",
     "contractNum",
     "branch_short_name",
+    "directorate_name",
 )
 DEFAULT_ADDRESS_KEYS = (
     "address",
@@ -191,6 +197,9 @@ DEFAULT_ADDRESS_KEYS = (
     "street_with_type",
     "city_district",
     "fiascode",
+    "address_name",
+    "directorate_address",
+    "CityName",
 )
 TOKEN_PREFIXES = {
     "phone": "PHONE_",
@@ -1463,10 +1472,39 @@ def prepare_content_file(path: Path, content: str) -> PreparedFile:
         raise
 
 
+def make_path_writable(path: Path) -> None:
+    mode = path.stat().st_mode
+    path.chmod(mode | stat.S_IWUSR | stat.S_IWRITE)
+
+
+def replace_file(temporary_path: Path, path: Path) -> None:
+    try:
+        os.replace(temporary_path, path)
+        return
+    except PermissionError:
+        LOGGER.warning(
+            "Atomic replace of %s was denied; clearing the read-only flag",
+            path,
+        )
+    make_path_writable(path)
+    try:
+        os.replace(temporary_path, path)
+        return
+    except PermissionError:
+        LOGGER.warning("Overwriting %s in place", path)
+    make_path_writable(path)
+    with temporary_path.open("rb") as source:
+        with path.open("wb") as destination:
+            shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+    temporary_path.unlink(missing_ok=True)
+
+
 def write_prepared_files(prepared: list[PreparedFile]) -> None:
     try:
         for item in prepared:
-            os.replace(item.temporary_path, item.path)
+            replace_file(item.temporary_path, item.path)
     finally:
         discard_prepared_files(prepared)
 
