@@ -52,6 +52,7 @@ DEFAULT_PHONE_KEYS = (
     "PhoneNumber",
     "cellPhone",
     "mainPhone",
+    "DealerPhone",
 )
 DEFAULT_INN_KEYS = ("inn", "tax_id")
 DEFAULT_KPP_KEYS = ("kpp",)
@@ -146,6 +147,7 @@ DEFAULT_ORGANIZATION_KEYS = (
     "contractNum",
     "branch_short_name",
     "directorate_name",
+    "DealerCenterName",
 )
 DEFAULT_ADDRESS_KEYS = (
     "address",
