@@ -53,6 +53,7 @@ DEFAULT_PHONE_KEYS = (
     "cellPhone",
     "mainPhone",
     "DealerPhone",
+    "office_phone",
 )
 DEFAULT_INN_KEYS = ("inn", "tax_id")
 DEFAULT_KPP_KEYS = ("kpp",)
@@ -76,6 +77,7 @@ DEFAULT_FIO_KEYS = (
     "shortName",
     "chiefName",
     "chiefPosition",
+    "office_user_name",
 )
 DEFAULT_ACCOUNT_KEYS = (
     "account",
@@ -107,6 +109,8 @@ DEFAULT_ACCOUNT_KEYS = (
     "directorate_cardoffice_id",
     "instance_5nt_database_link",
     "OfficeCode",
+    "database_link",
+    "result",
 )
 DEFAULT_PASSPORT_SERIES_KEYS = (
     "passport_series",
@@ -148,6 +152,8 @@ DEFAULT_ORGANIZATION_KEYS = (
     "branch_short_name",
     "directorate_name",
     "DealerCenterName",
+    "office_short_name",
+    "court_name",
 )
 DEFAULT_ADDRESS_KEYS = (
     "address",
@@ -202,6 +208,9 @@ DEFAULT_ADDRESS_KEYS = (
     "address_name",
     "directorate_address",
     "CityName",
+    "signing_address",
+    "federal_district",
+    "signing_place",
 )
 TOKEN_PREFIXES = {
     "phone": "PHONE_",
