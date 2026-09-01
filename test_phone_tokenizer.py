@@ -252,6 +252,24 @@ class PhoneTokenizerTest(unittest.TestCase):
                 '{"phone": "89992102974"}',
             )
 
+    def test_masks_a_single_file_without_touching_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "repo"
+            root.mkdir()
+            target = root / "client.json"
+            sibling = root / "other.json"
+            original = '{"phone": "89992102974"}'
+            target.write_text(original, encoding="utf-8")
+            sibling.write_text(original, encoding="utf-8")
+
+            self.assertEqual(main(["mask", str(target)]), 0)
+
+            self.assertEqual(
+                json.loads(target.read_text(encoding="utf-8"))["phone"],
+                "88888888888",
+            )
+            self.assertEqual(sibling.read_text(encoding="utf-8"), original)
+
     def test_masks_postgresql_insert_values_and_select(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "repo"

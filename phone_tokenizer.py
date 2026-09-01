@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Iterable, Literal
 
 
+SUPPORTED_SUFFIXES = {".json", ".xml", ".sql"}
+IGNORED_DIRECTORIES = {".git", ".idea", "unimock-dictionaries"}
 TOKEN_ALPHABET = string.ascii_uppercase
 TOKEN_LENGTH = 20
 LOGGER = logging.getLogger(__name__)
@@ -1307,16 +1309,19 @@ def transform_sql_document(
 
 
 def iter_data_files(root: Path) -> Iterable[Path]:
-    ignored_directories = {".git", ".idea", "unimock-dictionaries"}
+    if root.is_file():
+        yield root
+        return
+
     for current_directory, directory_names, file_names in os.walk(root):
         directory_names[:] = sorted(
-            name for name in directory_names if name not in ignored_directories
+            name for name in directory_names if name not in IGNORED_DIRECTORIES
         )
         current_path = Path(current_directory)
         for file_name in sorted(file_names):
             path = current_path / file_name
             if (
-                path.suffix.casefold() in {".json", ".xml", ".sql"}
+                path.suffix.casefold() in SUPPORTED_SUFFIXES
                 and path.is_file()
                 and not path.is_symlink()
             ):
@@ -1471,11 +1476,19 @@ def discard_prepared_files(prepared: list[PreparedFile]) -> None:
         item.temporary_path.unlink(missing_ok=True)
 
 
-def existing_directory(value: str) -> Path:
+def existing_mask_path(value: str) -> Path:
     path = Path(value).resolve()
-    if not path.is_dir():
-        raise argparse.ArgumentTypeError(f"Not a directory: {value}")
-    return path
+    if path.is_dir():
+        return path
+    if (
+        path.is_file()
+        and not path.is_symlink()
+        and path.suffix.casefold() in SUPPORTED_SUFFIXES
+    ):
+        return path
+    raise argparse.ArgumentTypeError(
+        f"Not a directory or JSON/XML/SQL file: {value}"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1485,9 +1498,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     mask = subparsers.add_parser(
-        "mask", help="Mask sensitive values in one or more repositories"
+        "mask", help="Mask sensitive values in repositories or individual files"
     )
-    mask.add_argument("roots", nargs="+", type=existing_directory)
+    mask.add_argument(
+        "roots",
+        nargs="+",
+        type=existing_mask_path,
+        metavar="PATH",
+        help="Directory to scan or a JSON/XML/SQL file to mask",
+    )
     mask.add_argument(
         "--phone-keys",
         default=",".join(DEFAULT_PHONE_KEYS),
