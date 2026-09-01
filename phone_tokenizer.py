@@ -233,13 +233,13 @@ class TokenizerError(RuntimeError):
     """Raised when depersonalization cannot be completed safely."""
 
 
-@dataclass(slots=True)
+@dataclass
 class PreparedFile:
     path: Path
     temporary_path: Path
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass
 class SqlToken:
     kind: str
     start: int
