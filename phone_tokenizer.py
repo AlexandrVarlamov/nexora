@@ -121,6 +121,7 @@ DEFAULT_CARD_NUMBER_KEYS = ("cardNumber", "card_number")
 DEFAULT_ORGANIZATION_KEYS = (
     "organization",
     "organizationName",
+    "organizationFullName",
     "organisationName",
     "company",
     "companyName",
