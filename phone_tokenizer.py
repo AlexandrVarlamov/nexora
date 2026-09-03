@@ -140,6 +140,9 @@ DEFAULT_EMPTY_KEYS = (
     "CBSubdivision",
     "OKPO",
     "PhoneNumber",
+    "DealerCenterName",
+    "StreetName",
+    "CityName",
 )
 DEFAULT_ORGANIZATION_KEYS = (
     "organization",

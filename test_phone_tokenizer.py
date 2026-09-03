@@ -351,6 +351,9 @@ class PhoneTokenizerTest(unittest.TestCase):
                         "OKPO": "00032537",
                         "PhoneNumber": "89992102974",
                         "Value": "секрет",
+                        "DealerCenterName": "Автоцентр",
+                        "StreetName": "Новослободская",
+                        "CityName": "Москва",
                     },
                     ensure_ascii=False,
                 ),
@@ -381,6 +384,9 @@ class PhoneTokenizerTest(unittest.TestCase):
                 "OKPO",
                 "PhoneNumber",
                 "Value",
+                "DealerCenterName",
+                "StreetName",
+                "CityName",
             ):
                 self.assertEqual(masked_json[key], "")
             masked_xml = ET.fromstring(xml_file.read_text(encoding="utf-8"))
@@ -444,7 +450,7 @@ class PhoneTokenizerTest(unittest.TestCase):
             self.assertIn('.setPhoneNumber("")', masked)
             self.assertIn(f'.address_name("{masked_address}")', masked)
             self.assertIn(f'.setAddress_name("{masked_address}")', masked)
-            self.assertIn('.CityName("' + "М" * len("Москва") + '")', masked)
+            self.assertIn('.CityName("")', masked)
             self.assertIn('.DealerPhone("88888888888")', masked)
             self.assertIn('setOfficePhone("88888888888")', masked)
             self.assertIn(f'addressName = "{masked_address}"', masked)
