@@ -13,6 +13,7 @@ from phone_tokenizer import (
     main,
     normalize_phone,
     prepare_masking,
+    snake_to_java_camel,
     write_prepared_files,
 )
 
@@ -271,6 +272,58 @@ class PhoneTokenizerTest(unittest.TestCase):
                 "88888888888",
             )
             self.assertEqual(sibling.read_text(encoding="utf-8"), original)
+
+    def test_converts_snake_case_keys_to_java_camel_case(self) -> None:
+        self.assertEqual(snake_to_java_camel("address_name"), "addressName")
+        self.assertEqual(snake_to_java_camel("office_phone"), "officePhone")
+        self.assertEqual(snake_to_java_camel("PhoneNumber"), "phoneNumber")
+        self.assertEqual(snake_to_java_camel("DealerPhone"), "dealerPhone")
+
+    def test_masks_java_lombok_and_setter_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "repo"
+            root.mkdir()
+            java_file = root / "Client.java"
+            sibling = root / "Other.java"
+            address = "Москва, Новослободская улица, 24"
+            java_file.write_text(
+                f"""class Client {{
+    void fill(Builder builder) {{
+        builder
+            .addressName("{address}")
+            .setAddressName("{address}")
+            .officePhone("89992102974")
+            .setOfficePhone("89992102974")
+            .setPhoneNumber("(4722)588292")
+            .getAddressName("{address}");
+        // .addressName("{address}")
+        String ignored = ".setAddressName(\\"{address}\\")";
+    }}
+}}
+""",
+                encoding="utf-8",
+            )
+            sibling.write_text(
+                f'class Other {{ void fill(Builder b) {{ b.addressName("{address}"); }} }}\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(main(["mask", str(java_file)]), 0)
+
+            masked = java_file.read_text(encoding="utf-8")
+            masked_address = "М" * len(address)
+            self.assertIn(f'.addressName("{masked_address}")', masked)
+            self.assertIn(f'.setAddressName("{masked_address}")', masked)
+            self.assertIn('.officePhone("88888888888")', masked)
+            self.assertIn('.setOfficePhone("88888888888")', masked)
+            self.assertIn('.setPhoneNumber("444444444444")', masked)
+            self.assertIn(f'.getAddressName("{address}")', masked)
+            self.assertIn(f'// .addressName("{address}")', masked)
+            self.assertIn(f'String ignored = ".setAddressName(\\"{address}\\")"', masked)
+            self.assertEqual(
+                sibling.read_text(encoding="utf-8"),
+                f'class Other {{ void fill(Builder b) {{ b.addressName("{address}"); }} }}\n',
+            )
 
     def test_overwrites_a_read_only_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

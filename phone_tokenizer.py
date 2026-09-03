@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Literal
 
 
-SUPPORTED_SUFFIXES = {".json", ".xml", ".sql"}
+SUPPORTED_SUFFIXES = {".json", ".xml", ".sql", ".java"}
 IGNORED_DIRECTORIES = {".git", ".idea", "unimock-dictionaries"}
 TOKEN_ALPHABET = string.ascii_uppercase
 TOKEN_LENGTH = 20
@@ -1331,6 +1331,308 @@ def transform_sql_document(
     return "".join(parts), replacement_count
 
 
+def snake_to_java_camel(key: str) -> str:
+    parts = [part for part in key.split("_") if part]
+    if not parts:
+        return key
+    first, *rest = parts
+    camel = first[:1].lower() + first[1:]
+    for part in rest:
+        camel += part[:1].upper() + part[1:]
+    return camel
+
+
+def java_method_kinds(source_keys: dict[str, str]) -> dict[str, str]:
+    methods: dict[str, str] = {}
+    for key, kind in source_keys.items():
+        camel = snake_to_java_camel(key)
+        if not camel:
+            continue
+        methods[camel] = kind
+        methods["set" + camel[:1].upper() + camel[1:]] = kind
+    return methods
+
+
+def is_java_identifier_start(character: str) -> bool:
+    return character.isalpha() or character == "_" or ord(character) > 127
+
+
+def is_java_identifier_part(character: str) -> bool:
+    return character.isalnum() or character in {"_", "$"} or ord(character) > 127
+
+
+def skip_java_line_comment(source: str, index: int) -> int:
+    newline = source.find("\n", index)
+    return len(source) if newline == -1 else newline + 1
+
+
+def skip_java_block_comment(source: str, index: int, path: Path | None) -> int:
+    close = source.find("*/", index + 2)
+    if close == -1:
+        raise TokenizerError(
+            f"Unterminated Java comment{sql_location(source, index, path)}"
+        )
+    return close + 2
+
+
+def skip_java_string(source: str, index: int, path: Path | None) -> int:
+    index += 1
+    while index < len(source):
+        character = source[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == '"':
+            return index + 1
+        if character == "\n":
+            break
+        index += 1
+    raise TokenizerError(
+        f"Unterminated Java string{sql_location(source, index, path)}"
+    )
+
+
+def skip_java_text_block(source: str, index: int, path: Path | None) -> int:
+    close = source.find('"""', index + 3)
+    if close == -1:
+        raise TokenizerError(
+            f"Unterminated Java text block{sql_location(source, index, path)}"
+        )
+    return close + 3
+
+
+def skip_java_char(source: str, index: int, path: Path | None) -> int:
+    index += 1
+    while index < len(source):
+        character = source[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == "'":
+            return index + 1
+        if character == "\n":
+            break
+        index += 1
+    raise TokenizerError(
+        f"Unterminated Java character literal{sql_location(source, index, path)}"
+    )
+
+
+def skip_java_whitespace_and_comments(
+    source: str, index: int, path: Path | None
+) -> int:
+    length = len(source)
+    while index < length:
+        character = source[index]
+        if character.isspace():
+            index += 1
+            continue
+        if source.startswith("//", index):
+            index = skip_java_line_comment(source, index)
+            continue
+        if source.startswith("/*", index):
+            index = skip_java_block_comment(source, index, path)
+            continue
+        break
+    return index
+
+
+def decode_java_string(literal: str) -> str:
+    inner = literal[1:-1]
+    decoded: list[str] = []
+    index = 0
+    while index < len(inner):
+        character = inner[index]
+        if character != "\\":
+            decoded.append(character)
+            index += 1
+            continue
+        if index + 1 >= len(inner):
+            break
+        escape = inner[index + 1]
+        escapes = {
+            "n": "\n",
+            "r": "\r",
+            "t": "\t",
+            "\\": "\\",
+            '"': '"',
+            "'": "'",
+        }
+        if escape in escapes:
+            decoded.append(escapes[escape])
+            index += 2
+            continue
+        decoded.append(escape)
+        index += 2
+    return "".join(decoded)
+
+
+def encode_java_string(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return '"' + escaped + '"'
+
+
+def read_java_number(source: str, index: int) -> tuple[int, str, str]:
+    start = index
+    length = len(source)
+    if source.startswith(("0x", "0X"), index):
+        index += 2
+        while index < length and (
+            source[index] in string.hexdigits or source[index] == "_"
+        ):
+            index += 1
+    else:
+        while index < length and (source[index].isdigit() or source[index] in "._"):
+            index += 1
+    digits = source[start:index]
+    suffix_start = index
+    if index < length and source[index] in {"L", "l", "F", "f", "D", "d"}:
+        index += 1
+    return index, digits.replace("_", ""), source[suffix_start:index]
+
+
+def match_java_method_call(
+    source: str, after_dot: int, path: Path | None
+) -> tuple[int, int, int] | None:
+    index = skip_java_whitespace_and_comments(source, after_dot, path)
+    if index >= len(source) or not is_java_identifier_start(source[index]):
+        return None
+    ident_start = index
+    index += 1
+    while index < len(source) and is_java_identifier_part(source[index]):
+        index += 1
+    ident_end = index
+    index = skip_java_whitespace_and_comments(source, index, path)
+    if index >= len(source) or source[index] != "(":
+        return None
+    return ident_start, ident_end, index
+
+
+def mask_java_arguments(
+    source: str,
+    path: Path,
+    open_paren: int,
+    kind: str,
+    tokens_by_value: dict[str, str],
+) -> tuple[int, dict[int, tuple[int, str]], int]:
+    replacements: dict[int, tuple[int, str]] = {}
+    replacement_count = 0
+    index = open_paren + 1
+    depth = 1
+    length = len(source)
+
+    while index < length and depth:
+        if source.startswith("//", index):
+            index = skip_java_line_comment(source, index)
+            continue
+        if source.startswith("/*", index):
+            index = skip_java_block_comment(source, index, path)
+            continue
+        if source.startswith('"""', index):
+            index = skip_java_text_block(source, index, path)
+            continue
+        character = source[index]
+        if character == '"':
+            end = skip_java_string(source, index, path)
+            if depth == 1:
+                original = decode_java_string(source[index:end])
+                masked = mask_structured_value(kind, original, tokens_by_value)
+                if masked is not None:
+                    replacements[index] = (end, encode_java_string(masked))
+                    replacement_count += 1
+            index = end
+            continue
+        if character == "'":
+            index = skip_java_char(source, index, path)
+            continue
+        if depth == 1 and character.isdigit():
+            end, digits, suffix = read_java_number(source, index)
+            masked = mask_structured_value(kind, digits, tokens_by_value)
+            if masked is not None:
+                if re.fullmatch(r"-?\d+", masked):
+                    replacements[index] = (end, masked + suffix)
+                else:
+                    replacements[index] = (end, encode_java_string(masked))
+                replacement_count += 1
+            index = end
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1, replacements, replacement_count
+        index += 1
+
+    raise TokenizerError(
+        f"Unterminated Java method call{sql_location(source, open_paren, path)}"
+    )
+
+
+def transform_java_document(
+    source: str,
+    path: Path,
+    method_kinds: dict[str, str],
+    tokens_by_value: dict[str, str],
+) -> tuple[str, int]:
+    replacements: dict[int, tuple[int, str]] = {}
+    replacement_count = 0
+    index = 0
+    length = len(source)
+
+    while index < length:
+        if source.startswith("//", index):
+            index = skip_java_line_comment(source, index)
+            continue
+        if source.startswith("/*", index):
+            index = skip_java_block_comment(source, index, path)
+            continue
+        if source.startswith('"""', index):
+            index = skip_java_text_block(source, index, path)
+            continue
+        character = source[index]
+        if character == '"':
+            index = skip_java_string(source, index, path)
+            continue
+        if character == "'":
+            index = skip_java_char(source, index, path)
+            continue
+        if character == ".":
+            matched = match_java_method_call(source, index + 1, path)
+            if matched is not None:
+                ident_start, ident_end, open_paren = matched
+                method_name = source[ident_start:ident_end]
+                kind = method_kinds.get(method_name)
+                if kind is not None:
+                    close, local_replacements, count = mask_java_arguments(
+                        source, path, open_paren, kind, tokens_by_value
+                    )
+                    replacements.update(local_replacements)
+                    replacement_count += count
+                    index = close
+                    continue
+        index += 1
+
+    if not replacements:
+        return source, replacement_count
+
+    parts: list[str] = []
+    cursor = 0
+    for start in sorted(replacements):
+        end, replacement = replacements[start]
+        parts.append(source[cursor:start])
+        parts.append(replacement)
+        cursor = end
+    parts.append(source[cursor:])
+    return "".join(parts), replacement_count
+
+
 def iter_data_files(root: Path) -> Iterable[Path]:
     if root.is_file():
         yield root
@@ -1419,9 +1721,17 @@ def prepare_masking(
     roots: list[Path],
     phone_keys: set[str] | None = None,
     field_types: dict[str, str] | None = None,
+    source_keys: dict[str, str] | None = None,
 ) -> tuple[list[PreparedFile], int]:
     if field_types is None:
         field_types = {key.casefold(): "phone" for key in (phone_keys or set())}
+    if source_keys is None:
+        source_keys = (
+            {key: "phone" for key in phone_keys}
+            if phone_keys
+            else dict(field_types)
+        )
+    java_methods = java_method_kinds(source_keys)
     tokens_by_value: dict[str, str] = {}
     prepared: list[PreparedFile] = []
     replacement_count = 0
@@ -1439,7 +1749,12 @@ def prepare_masking(
                     continue
 
                 source = path.read_text(encoding="utf-8")
-                if path.suffix.casefold() == ".json":
+                suffix = path.suffix.casefold()
+                if suffix == ".java":
+                    serialized, count = transform_java_document(
+                        source, path, java_methods, tokens_by_value
+                    )
+                elif suffix == ".json":
                     try:
                         document = json.loads(source)
                     except json.JSONDecodeError as error:
@@ -1539,7 +1854,7 @@ def existing_mask_path(value: str) -> Path:
     ):
         return path
     raise argparse.ArgumentTypeError(
-        f"Not a directory or JSON/XML/SQL file: {value}"
+        f"Not a directory or JSON/XML/SQL/Java file: {value}"
     )
 
 
@@ -1557,7 +1872,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         type=existing_mask_path,
         metavar="PATH",
-        help="Directory to scan or a JSON/XML/SQL file to mask",
+        help="Directory to scan or a JSON/XML/SQL/Java file to mask",
     )
     mask.add_argument(
         "--phone-keys",
@@ -1625,6 +1940,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         field_types: dict[str, str] = {}
+        source_keys: dict[str, str] = {}
         for kind, raw_keys in (
             ("phone", args.phone_keys),
             ("inn", args.inn_keys),
@@ -1640,11 +1956,15 @@ def main(argv: list[str] | None = None) -> int:
         ):
             for key in raw_keys.split(","):
                 if key.strip():
-                    field_types[key.strip().casefold()] = kind
+                    original_key = key.strip()
+                    field_types[original_key.casefold()] = kind
+                    source_keys[original_key] = kind
         if not field_types:
             raise TokenizerError("At least one sensitive field key is required")
 
-        prepared, count = prepare_masking(args.roots, field_types=field_types)
+        prepared, count = prepare_masking(
+            args.roots, field_types=field_types, source_keys=source_keys
+        )
         if args.dry_run:
             print(
                 f"Would replace {count} sensitive value(s) "
