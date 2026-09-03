@@ -1342,14 +1342,21 @@ def snake_to_java_camel(key: str) -> str:
     return camel
 
 
+def java_setter_name(field_name: str) -> str:
+    if not field_name:
+        return field_name
+    return "set" + field_name[:1].upper() + field_name[1:]
+
+
 def java_method_kinds(source_keys: dict[str, str]) -> dict[str, str]:
     methods: dict[str, str] = {}
     for key, kind in source_keys.items():
-        camel = snake_to_java_camel(key)
-        if not camel:
-            continue
-        methods[camel] = kind
-        methods["set" + camel[:1].upper() + camel[1:]] = kind
+        names = {key, snake_to_java_camel(key)}
+        for name in names:
+            if not name:
+                continue
+            methods[name] = kind
+            methods[java_setter_name(name)] = kind
     return methods
 
 
@@ -1497,21 +1504,41 @@ def read_java_number(source: str, index: int) -> tuple[int, str, str]:
     return index, digits.replace("_", ""), source[suffix_start:index]
 
 
-def match_java_method_call(
-    source: str, after_dot: int, path: Path | None
-) -> tuple[int, int, int] | None:
-    index = skip_java_whitespace_and_comments(source, after_dot, path)
-    if index >= len(source) or not is_java_identifier_start(source[index]):
-        return None
-    ident_start = index
-    index += 1
-    while index < len(source) and is_java_identifier_part(source[index]):
-        index += 1
-    ident_end = index
-    index = skip_java_whitespace_and_comments(source, index, path)
-    if index >= len(source) or source[index] != "(":
-        return None
-    return ident_start, ident_end, index
+def mask_java_value(
+    source: str,
+    path: Path,
+    index: int,
+    kind: str,
+    tokens_by_value: dict[str, str],
+) -> tuple[int, dict[int, tuple[int, str]], int]:
+    if index >= len(source):
+        return index, {}, 0
+    if source.startswith('"""', index):
+        end = skip_java_text_block(source, index, path)
+        original = source[index + 3 : end - 3]
+        masked = mask_structured_value(kind, original, tokens_by_value)
+        if masked is None:
+            return end, {}, 0
+        return end, {index: (end, encode_java_string(masked))}, 1
+    if source[index] == '"':
+        end = skip_java_string(source, index, path)
+        original = decode_java_string(source[index:end])
+        masked = mask_structured_value(kind, original, tokens_by_value)
+        if masked is None:
+            return end, {}, 0
+        return end, {index: (end, encode_java_string(masked))}, 1
+    if source[index].isdigit():
+        end, digits, suffix = read_java_number(source, index)
+        masked = mask_structured_value(kind, digits, tokens_by_value)
+        if masked is None:
+            return end, {}, 0
+        replacement = (
+            masked + suffix
+            if re.fullmatch(r"-?\d+", masked)
+            else encode_java_string(masked)
+        )
+        return end, {index: (end, replacement)}, 1
+    return index, {}, 0
 
 
 def mask_java_arguments(
@@ -1534,33 +1561,29 @@ def mask_java_arguments(
         if source.startswith("/*", index):
             index = skip_java_block_comment(source, index, path)
             continue
-        if source.startswith('"""', index):
-            index = skip_java_text_block(source, index, path)
-            continue
         character = source[index]
-        if character == '"':
-            end = skip_java_string(source, index, path)
-            if depth == 1:
-                original = decode_java_string(source[index:end])
-                masked = mask_structured_value(kind, original, tokens_by_value)
-                if masked is not None:
-                    replacements[index] = (end, encode_java_string(masked))
-                    replacement_count += 1
-            index = end
-            continue
-        if character == "'":
+        if character == "'" :
             index = skip_java_char(source, index, path)
             continue
-        if depth == 1 and character.isdigit():
-            end, digits, suffix = read_java_number(source, index)
-            masked = mask_structured_value(kind, digits, tokens_by_value)
-            if masked is not None:
-                if re.fullmatch(r"-?\d+", masked):
-                    replacements[index] = (end, masked + suffix)
+        if (
+            source.startswith('"""', index)
+            or character == '"'
+            or (depth == 1 and character.isdigit())
+        ):
+            if depth != 1:
+                if source.startswith('"""', index):
+                    index = skip_java_text_block(source, index, path)
+                elif character == '"':
+                    index = skip_java_string(source, index, path)
                 else:
-                    replacements[index] = (end, encode_java_string(masked))
-                replacement_count += 1
-            index = end
+                    index = read_java_number(source, index)[0]
+                continue
+            end, local_replacements, count = mask_java_value(
+                source, path, index, kind, tokens_by_value
+            )
+            replacements.update(local_replacements)
+            replacement_count += count
+            index = end if end != index else index + 1
             continue
         if character == "(":
             depth += 1
@@ -1603,20 +1626,40 @@ def transform_java_document(
         if character == "'":
             index = skip_java_char(source, index, path)
             continue
-        if character == ".":
-            matched = match_java_method_call(source, index + 1, path)
-            if matched is not None:
-                ident_start, ident_end, open_paren = matched
-                method_name = source[ident_start:ident_end]
-                kind = method_kinds.get(method_name)
-                if kind is not None:
-                    close, local_replacements, count = mask_java_arguments(
-                        source, path, open_paren, kind, tokens_by_value
-                    )
-                    replacements.update(local_replacements)
-                    replacement_count += count
-                    index = close
-                    continue
+        if is_java_identifier_start(character):
+            ident_start = index
+            index += 1
+            while index < length and is_java_identifier_part(source[index]):
+                index += 1
+            method_name = source[ident_start:index]
+            kind = method_kinds.get(method_name)
+            if kind is None:
+                continue
+            next_index = skip_java_whitespace_and_comments(source, index, path)
+            if next_index < length and source[next_index] == "(":
+                close, local_replacements, count = mask_java_arguments(
+                    source, path, next_index, kind, tokens_by_value
+                )
+                replacements.update(local_replacements)
+                replacement_count += count
+                index = close
+                continue
+            if (
+                next_index < length
+                and source[next_index] == "="
+                and not source.startswith("==", next_index)
+            ):
+                value_index = skip_java_whitespace_and_comments(
+                    source, next_index + 1, path
+                )
+                close, local_replacements, count = mask_java_value(
+                    source, path, value_index, kind, tokens_by_value
+                )
+                replacements.update(local_replacements)
+                replacement_count += count
+                index = close
+                continue
+            continue
         index += 1
 
     if not replacements:

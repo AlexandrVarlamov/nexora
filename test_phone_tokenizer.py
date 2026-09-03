@@ -295,7 +295,13 @@ class PhoneTokenizerTest(unittest.TestCase):
             .officePhone("89992102974")
             .setOfficePhone("89992102974")
             .setPhoneNumber("(4722)588292")
+            .address_name("{address}")
+            .setAddress_name("{address}")
+            .CityName("Москва")
+            .DealerPhone("89992102974")
             .getAddressName("{address}");
+        setOfficePhone("89992102974");
+        addressName = "{address}";
         // .addressName("{address}")
         String ignored = ".setAddressName(\\"{address}\\")";
     }}
@@ -317,6 +323,12 @@ class PhoneTokenizerTest(unittest.TestCase):
             self.assertIn('.officePhone("88888888888")', masked)
             self.assertIn('.setOfficePhone("88888888888")', masked)
             self.assertIn('.setPhoneNumber("444444444444")', masked)
+            self.assertIn(f'.address_name("{masked_address}")', masked)
+            self.assertIn(f'.setAddress_name("{masked_address}")', masked)
+            self.assertIn('.CityName("' + "М" * len("Москва") + '")', masked)
+            self.assertIn('.DealerPhone("88888888888")', masked)
+            self.assertIn('setOfficePhone("88888888888")', masked)
+            self.assertIn(f'addressName = "{masked_address}"', masked)
             self.assertIn(f'.getAddressName("{address}")', masked)
             self.assertIn(f'// .addressName("{address}")', masked)
             self.assertIn(f'String ignored = ".setAddressName(\\"{address}\\")"', masked)
