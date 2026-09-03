@@ -1893,6 +1893,9 @@ def prepare_masking(
                         source, path, java_methods, tokens_by_value, java_keys
                     )
                 elif suffix == ".json":
+                    if not source.strip():
+                        LOGGER.warning("Skipping empty JSON file %s", path)
+                        continue
                     try:
                         document = json.loads(source)
                     except json.JSONDecodeError as error:
