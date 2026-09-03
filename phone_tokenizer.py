@@ -1562,7 +1562,7 @@ def mask_java_arguments(
             index = skip_java_block_comment(source, index, path)
             continue
         character = source[index]
-        if character == "'" :
+        if character == "'":
             index = skip_java_char(source, index, path)
             continue
         if (
