@@ -301,6 +301,38 @@ class PhoneTokenizerTest(unittest.TestCase):
                 "88888888888",
             )
 
+    def test_skips_empty_xml_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "repo"
+            root.mkdir()
+            empty_file = root / "empty.xml"
+            blank_file = root / "blank.xml"
+            data_file = root / "client.xml"
+            empty_file.write_text("", encoding="utf-8")
+            blank_file.write_text(" \n\t", encoding="utf-8")
+            data_file.write_text(
+                "<root><phone>89992102974</phone></root>", encoding="utf-8"
+            )
+
+            with self.assertLogs("phone_tokenizer", level="WARNING") as logs:
+                prepared, count = prepare_masking(
+                    [root], field_types={"phone": "phone"}
+                )
+            self.assertEqual(count, 1)
+            self.assertEqual([item.path for item in prepared], [data_file])
+            self.assertTrue(
+                any("Skipping empty XML file" in message for message in logs.output)
+            )
+            write_prepared_files(prepared)
+            self.assertEqual(empty_file.read_text(encoding="utf-8"), "")
+            self.assertEqual(blank_file.read_text(encoding="utf-8"), " \n\t")
+            self.assertEqual(
+                ET.fromstring(data_file.read_text(encoding="utf-8")).findtext(
+                    "phone"
+                ),
+                "88888888888",
+            )
+
     def test_converts_snake_case_keys_to_java_camel_case(self) -> None:
         self.assertEqual(snake_to_java_camel("address_name"), "addressName")
         self.assertEqual(snake_to_java_camel("office_phone"), "officePhone")

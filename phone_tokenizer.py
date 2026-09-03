@@ -1909,6 +1909,9 @@ def prepare_masking(
                     )
                     serialized = serialize_json(document, source)
                 else:
+                    if not source.strip():
+                        LOGGER.warning("Skipping empty XML file %s", path)
+                        continue
                     document = parse_xml_document(source, path)
                     count = transform_xml_document(
                         document=document,
