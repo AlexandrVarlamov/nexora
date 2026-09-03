@@ -351,7 +351,7 @@ class PhoneTokenizerTest(unittest.TestCase):
                         "OKPO": "00032537",
                         "PhoneNumber": "89992102974",
                         "Value": "секрет",
-                        "DealerCenterName": "Автоцентр",
+                        "DealerCenterName(e-Credit)": "Автоцентр",
                         "StreetName": "Новослободская",
                         "CityName": "Москва",
                     },
@@ -369,7 +369,8 @@ class PhoneTokenizerTest(unittest.TestCase):
                 encoding="utf-8",
             )
             java_file.write_text(
-                'class Bank { void fill(B b) { b.NameP("ПАО Банк").setBIK("044525225"); } }\n',
+                'class Bank { void fill(B b) { b.NameP("ПАО Банк").setBIK("044525225")'
+                '.put("DealerCenterName(e-Credit)", "Автоцентр"); } }\n',
                 encoding="utf-8",
             )
 
@@ -384,7 +385,7 @@ class PhoneTokenizerTest(unittest.TestCase):
                 "OKPO",
                 "PhoneNumber",
                 "Value",
-                "DealerCenterName",
+                "DealerCenterName(e-Credit)",
                 "StreetName",
                 "CityName",
             ):
@@ -397,6 +398,7 @@ class PhoneTokenizerTest(unittest.TestCase):
             masked_java = java_file.read_text(encoding="utf-8")
             self.assertIn('.NameP("")', masked_java)
             self.assertIn('.setBIK("")', masked_java)
+            self.assertIn('.put("DealerCenterName(e-Credit)", "")', masked_java)
 
     def test_converts_snake_case_keys_to_java_camel_case(self) -> None:
         self.assertEqual(snake_to_java_camel("address_name"), "addressName")

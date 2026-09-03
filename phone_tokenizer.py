@@ -140,7 +140,7 @@ DEFAULT_EMPTY_KEYS = (
     "CBSubdivision",
     "OKPO",
     "PhoneNumber",
-    "DealerCenterName",
+    "DealerCenterName(e-Credit)",
     "StreetName",
     "CityName",
 )
