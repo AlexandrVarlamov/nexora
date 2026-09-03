@@ -333,6 +333,65 @@ class PhoneTokenizerTest(unittest.TestCase):
                 "88888888888",
             )
 
+    def test_clears_configured_empty_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "repo"
+            root.mkdir()
+            json_file = root / "bank.json"
+            xml_file = root / "bank.xml"
+            sql_file = root / "bank.sql"
+            java_file = root / "Bank.java"
+            json_file.write_text(
+                json.dumps(
+                    {
+                        "NameP": "ПАО Банк",
+                        "BIK": "044525225",
+                        "OKATO": "45286585000",
+                        "CBSubdivision": "ГУ Банка России",
+                        "OKPO": "00032537",
+                        "PhoneNumber": "89992102974",
+                        "Value": "секрет",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            xml_file.write_text(
+                '<bank NameP="ПАО Банк"><BIK>044525225</BIK></bank>',
+                encoding="utf-8",
+            )
+            sql_file.write_text(
+                "INSERT INTO banks (NameP, BIK, PhoneNumber) "
+                "VALUES ('ПАО Банк', '044525225', '89992102974');\n",
+                encoding="utf-8",
+            )
+            java_file.write_text(
+                'class Bank { void fill(B b) { b.NameP("ПАО Банк").setBIK("044525225"); } }\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(main(["mask", str(root)]), 0)
+
+            masked_json = json.loads(json_file.read_text(encoding="utf-8"))
+            for key in (
+                "NameP",
+                "BIK",
+                "OKATO",
+                "CBSubdivision",
+                "OKPO",
+                "PhoneNumber",
+                "Value",
+            ):
+                self.assertEqual(masked_json[key], "")
+            masked_xml = ET.fromstring(xml_file.read_text(encoding="utf-8"))
+            self.assertEqual(masked_xml.attrib["NameP"], "")
+            self.assertEqual(masked_xml.findtext("BIK"), "")
+            masked_sql = sql_file.read_text(encoding="utf-8")
+            self.assertIn("VALUES ('', '', '');", masked_sql)
+            masked_java = java_file.read_text(encoding="utf-8")
+            self.assertIn('.NameP("")', masked_java)
+            self.assertIn('.setBIK("")', masked_java)
+
     def test_converts_snake_case_keys_to_java_camel_case(self) -> None:
         self.assertEqual(snake_to_java_camel("address_name"), "addressName")
         self.assertEqual(snake_to_java_camel("office_phone"), "officePhone")
@@ -382,7 +441,7 @@ class PhoneTokenizerTest(unittest.TestCase):
             self.assertIn(f'.setAddressName("{masked_address}")', masked)
             self.assertIn('.officePhone("88888888888")', masked)
             self.assertIn('.setOfficePhone("88888888888")', masked)
-            self.assertIn('.setPhoneNumber("444444444444")', masked)
+            self.assertIn('.setPhoneNumber("")', masked)
             self.assertIn(f'.address_name("{masked_address}")', masked)
             self.assertIn(f'.setAddress_name("{masked_address}")', masked)
             self.assertIn('.CityName("' + "М" * len("Москва") + '")', masked)

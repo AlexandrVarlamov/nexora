@@ -132,6 +132,15 @@ DEFAULT_PASSPORT_NUMBER_KEYS = (
 )
 DEFAULT_OGRN_KEYS = ("ogrn", "ogrn_number", "ogrnNumber")
 DEFAULT_CARD_NUMBER_KEYS = ("cardNumber", "card_number")
+DEFAULT_EMPTY_KEYS = (
+    "Value",
+    "NameP",
+    "BIK",
+    "OKATO",
+    "CBSubdivision",
+    "OKPO",
+    "PhoneNumber",
+)
 DEFAULT_ORGANIZATION_KEYS = (
     "organization",
     "organizationName",
@@ -231,6 +240,7 @@ TOKEN_PREFIXES = {
     "card_number": "CARD_",
     "organization": "ORGANIZATION_",
     "address": "ADDRESS_",
+    "empty": "EMPTY_",
 }
 EMAIL_PATTERN = re.compile(
     r"(?<![\w.+-])"
@@ -571,6 +581,12 @@ def normalize_phone(value: Any) -> str | None:
 
 
 def normalize_sensitive_value(kind: str, value: Any) -> str | None:
+    if kind == "empty":
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            return None
+        if str(value) == "":
+            return None
+        return str(value)
     if isinstance(value, str) and re.fullmatch(
         rf"{re.escape(TOKEN_PREFIXES[kind])}[A-Z]{{{TOKEN_LENGTH}}}", value
     ):
@@ -632,6 +648,8 @@ def mask_structured_value(
     canonical = normalize_sensitive_value(kind, value)
     if canonical is None:
         return None
+    if kind == "empty":
+        return ""
     if kind in REPEATED_DIGIT_KINDS:
         raw_value = str(value)
         first_symbol = next(
@@ -2074,6 +2092,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated address field names",
     )
     mask.add_argument(
+        "--empty-keys",
+        default=",".join(DEFAULT_EMPTY_KEYS),
+        help="Comma-separated field names replaced with an empty string",
+    )
+    mask.add_argument(
         "--dry-run", action="store_true", help="Report replacements without writing files"
     )
 
@@ -2097,6 +2120,7 @@ def main(argv: list[str] | None = None) -> int:
             ("card_number", args.card_number_keys),
             ("organization", args.organization_keys),
             ("address", args.address_keys),
+            ("empty", args.empty_keys),
         ):
             for key in raw_keys.split(","):
                 if key.strip():
