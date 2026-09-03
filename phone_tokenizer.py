@@ -246,6 +246,9 @@ GPBU_LOGIN_PATTERN = re.compile(
     r"(?![A-Z0-9_-])",
     re.IGNORECASE,
 )
+RUSSIAN_PHONE_PATTERN = re.compile(
+    r"(?<!\d)(?:\+7|8)(?:[\s\-()]*\d){10}(?!\d)"
+)
 PRIVATE_IPV4_NETWORKS = tuple(
     ipaddress.ip_network(network)
     for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -573,7 +576,12 @@ def normalize_sensitive_value(kind: str, value: Any) -> str | None:
     ):
         return None
     if kind == "phone":
-        return normalize_phone(value)
+        canonical = normalize_phone(value)
+        if canonical is not None:
+            return canonical
+        if isinstance(value, str) and value.strip():
+            return " ".join(value.split()).casefold()
+        return None
     if kind == "fio":
         if not isinstance(value, str) or not value.strip():
             return None
@@ -627,7 +635,12 @@ def mask_structured_value(
     if kind in REPEATED_DIGIT_KINDS:
         raw_value = str(value)
         first_symbol = next(
-            (symbol for symbol in raw_value if symbol.isalnum()), None
+            (
+                symbol
+                for symbol in raw_value
+                if symbol.isalnum() or (kind == "phone" and symbol == "+")
+            ),
+            None,
         )
         return first_symbol * len(raw_value) if first_symbol else None
     token = get_or_create_token(kind, canonical, tokens_by_value)
@@ -662,9 +675,22 @@ def mask_embedded_text(
         match_count += 1
         return get_or_create_token("user", login.casefold(), tokens_by_value)
 
+    def replace_phone(match: re.Match[str]) -> str:
+        nonlocal match_count
+        raw = match.group(0)
+        first_symbol = next(
+            (symbol for symbol in raw if symbol.isalnum() or symbol == "+"),
+            None,
+        )
+        if first_symbol is None:
+            return raw
+        match_count += 1
+        return first_symbol * len(raw)
+
     masked = EMAIL_PATTERN.sub(replace_email, value)
     masked = IPV4_PATTERN.sub(replace_ip, masked)
     masked = GPBU_LOGIN_PATTERN.sub(replace_user, masked)
+    masked = RUSSIAN_PHONE_PATTERN.sub(replace_phone, masked)
     return masked, match_count
 
 
@@ -1357,7 +1383,26 @@ def java_method_kinds(source_keys: dict[str, str]) -> dict[str, str]:
                 continue
             methods[name] = kind
             methods[java_setter_name(name)] = kind
+            methods[name[:1].upper() + name[1:]] = kind
     return methods
+
+
+def java_field_key_kinds(source_keys: dict[str, str]) -> dict[str, str]:
+    kinds: dict[str, str] = {}
+    for key, kind in source_keys.items():
+        camel = snake_to_java_camel(key)
+        for variant in (key, camel, key.casefold(), camel.casefold()):
+            if variant:
+                kinds[variant] = kind
+    return kinds
+
+
+def kind_for_java_key_literal(text: str, key_kinds: dict[str, str]) -> str | None:
+    candidate = text.strip()
+    if candidate.startswith("$."):
+        candidate = candidate[2:]
+    candidate = candidate.rsplit(".", 1)[-1]
+    return key_kinds.get(candidate) or key_kinds.get(candidate.casefold())
 
 
 def is_java_identifier_start(character: str) -> bool:
@@ -1545,14 +1590,18 @@ def mask_java_arguments(
     source: str,
     path: Path,
     open_paren: int,
-    kind: str,
+    kind: str | None,
     tokens_by_value: dict[str, str],
+    key_kinds: dict[str, str] | None = None,
 ) -> tuple[int, dict[int, tuple[int, str]], int]:
     replacements: dict[int, tuple[int, str]] = {}
     replacement_count = 0
     index = open_paren + 1
     depth = 1
     length = len(source)
+    argument_kind = kind
+    next_argument_kind: str | None = None
+    key_kinds = key_kinds or {}
 
     while index < length and depth:
         if source.startswith("//", index):
@@ -1565,27 +1614,54 @@ def mask_java_arguments(
         if character == "'":
             index = skip_java_char(source, index, path)
             continue
-        if (
-            source.startswith('"""', index)
-            or character == '"'
-            or (depth == 1 and character.isdigit())
-        ):
-            if depth != 1:
-                if source.startswith('"""', index):
-                    index = skip_java_text_block(source, index, path)
-                elif character == '"':
-                    index = skip_java_string(source, index, path)
-                else:
-                    index = read_java_number(source, index)[0]
-                continue
-            end, local_replacements, count = mask_java_value(
-                source, path, index, kind, tokens_by_value
+        if source.startswith('"""', index) or character == '"':
+            is_text_block = source.startswith('"""', index)
+            end = (
+                skip_java_text_block(source, index, path)
+                if is_text_block
+                else skip_java_string(source, index, path)
             )
-            replacements.update(local_replacements)
-            replacement_count += count
-            index = end if end != index else index + 1
+            original = (
+                source[index + 3 : end - 3]
+                if is_text_block
+                else decode_java_string(source[index:end])
+            )
+            kind_to_use = kind if depth >= 1 and kind else None
+            if depth == 1 and argument_kind:
+                kind_to_use = argument_kind
+            if kind_to_use:
+                masked = mask_structured_value(
+                    kind_to_use, original, tokens_by_value
+                )
+                if masked is not None:
+                    replacements[index] = (end, encode_java_string(masked))
+                    replacement_count += 1
+            elif depth == 1:
+                looked_up = kind_for_java_key_literal(original, key_kinds)
+                if looked_up:
+                    next_argument_kind = looked_up
+            index = end
             continue
-        if character == "(":
+        if depth == 1 and character.isdigit():
+            if argument_kind or kind:
+                end, local_replacements, count = mask_java_value(
+                    source,
+                    path,
+                    index,
+                    argument_kind or kind,
+                    tokens_by_value,
+                )
+                replacements.update(local_replacements)
+                replacement_count += count
+                index = end if end != index else index + 1
+            else:
+                index = read_java_number(source, index)[0]
+            continue
+        if character == ",":
+            if depth == 1:
+                argument_kind = next_argument_kind or kind
+                next_argument_kind = None
+        elif character == "(":
             depth += 1
         elif character == ")":
             depth -= 1
@@ -1603,11 +1679,13 @@ def transform_java_document(
     path: Path,
     method_kinds: dict[str, str],
     tokens_by_value: dict[str, str],
+    key_kinds: dict[str, str] | None = None,
 ) -> tuple[str, int]:
     replacements: dict[int, tuple[int, str]] = {}
     replacement_count = 0
     index = 0
     length = len(source)
+    key_kinds = key_kinds or {}
 
     while index < length:
         if source.startswith("//", index):
@@ -1617,11 +1695,23 @@ def transform_java_document(
             index = skip_java_block_comment(source, index, path)
             continue
         if source.startswith('"""', index):
-            index = skip_java_text_block(source, index, path)
+            end = skip_java_text_block(source, index, path)
+            original = source[index + 3 : end - 3]
+            masked, count = mask_embedded_text(original, tokens_by_value)
+            if masked != original:
+                replacements[index] = (end, encode_java_string(masked))
+                replacement_count += count
+            index = end
             continue
         character = source[index]
         if character == '"':
-            index = skip_java_string(source, index, path)
+            end = skip_java_string(source, index, path)
+            original = decode_java_string(source[index:end])
+            masked, count = mask_embedded_text(original, tokens_by_value)
+            if masked != original:
+                replacements[index] = (end, encode_java_string(masked))
+                replacement_count += count
+            index = end
             continue
         if character == "'":
             index = skip_java_char(source, index, path)
@@ -1633,19 +1723,23 @@ def transform_java_document(
                 index += 1
             method_name = source[ident_start:index]
             kind = method_kinds.get(method_name)
-            if kind is None:
-                continue
             next_index = skip_java_whitespace_and_comments(source, index, path)
             if next_index < length and source[next_index] == "(":
                 close, local_replacements, count = mask_java_arguments(
-                    source, path, next_index, kind, tokens_by_value
+                    source,
+                    path,
+                    next_index,
+                    kind,
+                    tokens_by_value,
+                    key_kinds,
                 )
                 replacements.update(local_replacements)
                 replacement_count += count
                 index = close
                 continue
             if (
-                next_index < length
+                kind is not None
+                and next_index < length
                 and source[next_index] == "="
                 and not source.startswith("==", next_index)
             ):
@@ -1775,6 +1869,7 @@ def prepare_masking(
             else dict(field_types)
         )
     java_methods = java_method_kinds(source_keys)
+    java_keys = java_field_key_kinds(source_keys)
     tokens_by_value: dict[str, str] = {}
     prepared: list[PreparedFile] = []
     replacement_count = 0
@@ -1795,7 +1890,7 @@ def prepare_masking(
                 suffix = path.suffix.casefold()
                 if suffix == ".java":
                     serialized, count = transform_java_document(
-                        source, path, java_methods, tokens_by_value
+                        source, path, java_methods, tokens_by_value, java_keys
                     )
                 elif suffix == ".json":
                     try:

@@ -337,6 +337,32 @@ class PhoneTokenizerTest(unittest.TestCase):
                 f'class Other {{ void fill(Builder b) {{ b.addressName("{address}"); }} }}\n',
             )
 
+    def test_masks_java_phone_with_plus_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "repo"
+            root.mkdir()
+            java_file = root / "Phone.java"
+            java_file.write_text(
+                """class Phone {
+    void fill(Builder builder) {
+        builder.phone("+79992089129");
+        builder.phone(Optional.of("+79992089129"));
+        map.put("phone", "+79992089129");
+        String snippet = "builder.phone(\\"+79992089129\\")";
+    }
+}
+""",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(main(["mask", str(java_file)]), 0)
+            masked = java_file.read_text(encoding="utf-8")
+            self.assertNotIn("+79992089129", masked)
+            self.assertIn('.phone("++++++++++++")', masked)
+            self.assertIn('Optional.of("++++++++++++")', masked)
+            self.assertIn('put("phone", "++++++++++++")', masked)
+            self.assertIn("++++++++++++", masked)
+
     def test_overwrites_a_read_only_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "repo"
@@ -506,14 +532,15 @@ SELECT phone FROM staging_clients;
                 prepared, count = prepare_masking(
                     [root], field_types={"phone": "phone"}
                 )
-            self.assertEqual(count, 0)
-            self.assertEqual(prepared, [])
+            self.assertEqual(count, 1)
+            self.assertEqual([item.path for item in prepared], [sql_file])
             self.assertIn(
                 f"Skipping SQL INSERT without an explicit target column list "
                 f"in {sql_file} at line 2",
                 logs.output[0],
             )
-            self.assertEqual(sql_file.read_text(encoding="utf-8"), original)
+            write_prepared_files(prepared)
+            self.assertIn("'88888888888'", sql_file.read_text(encoding="utf-8"))
             self.assertEqual(list(root.glob(".*.tmp")), [])
 
     def test_skips_sql_insert_default_values(self) -> None:
